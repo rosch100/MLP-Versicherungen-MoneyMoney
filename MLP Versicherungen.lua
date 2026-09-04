@@ -7,7 +7,7 @@
 -- Version: 0.91 (Beta)
 
 WebBanking{
-  version     = 0.91,
+  version     = 0.92,
   url         = "https://kundenportal.mlp.de",
   services    = {"MLP Versicherungen"},
   description = "MLP Versicherungen — Beta (Cookie-Import)"
@@ -485,48 +485,82 @@ end
 
 function restoreConnection(accountKey)
   local storage = rawget(_G, "LocalStorage")
-  local canReuse =
-    storage and storage.connection and storage.connectionAccountKey == accountKey
+  accountKey = accountKey or ""
+  local canReuse = false
 
-  if canReuse then
-    connection = storage.connection
-    session.persistedConnection = true
-    MM.printStatus("MLP: Persistierte Connection wiederverwendet.")
+  if storage then
+    storage.connectionsByAccount = storage.connectionsByAccount or {}
+    local entry = storage.connectionsByAccount[accountKey]
+    -- Active single-slot is authoritative when the accountKey matches (legacy + tests).
+    if storage.connection ~= nil and storage.connectionAccountKey == accountKey then
+      entry = entry or {}
+      entry.connection = storage.connection
+      if type(storage.sessionCookies) == "table" and entry.sessionCookies == nil then
+        entry.sessionCookies = storage.sessionCookies
+      end
+      storage.connectionsByAccount[accountKey] = entry
+    end
+    canReuse = entry ~= nil and entry.connection ~= nil
+    if canReuse then
+      connection = entry.connection
+      session.persistedConnection = true
+      MM.printStatus("MLP: Persistierte Connection wiederverwendet.")
+    else
+      connection = Connection()
+      storage.connectionsByAccount[accountKey] = { connection = connection }
+      session.persistedConnection = true
+    end
+    storage.connection = connection
+    storage.connectionAccountKey = accountKey
   else
     connection = Connection()
-    if storage then
-      storage.connection = connection
-      storage.connectionAccountKey = accountKey
-      session.persistedConnection = true
-    else
-      session.persistedConnection = false
-    end
+    session.persistedConnection = false
   end
 
   connection.language = "de-DE"
-  if type(Connection) == "function" then
-    connection.useragent = Connection().useragent or CONSTANTS.userAgent
-  else
-    connection.useragent = CONSTANTS.userAgent
-  end
+  connection.useragent = CONSTANTS.userAgent
 
   return canReuse, storage
 end
 
 function restorePersistedSessionCookies(storage, canReuse)
   session.sessionCookies = {}
-  if canReuse and storage and type(storage.sessionCookies) == "table" then
-    for name, value in pairs(storage.sessionCookies) do
-      session.sessionCookies[name] = value
-    end
-    MM.printStatus("MLP: Session-Cookies aus LocalStorage wiederhergestellt.")
+  if not canReuse or not storage then
+    return
   end
+  local accountKey = storage.connectionAccountKey or ""
+  local entry = storage.connectionsByAccount
+    and storage.connectionsByAccount[accountKey]
+  local cookies = entry and entry.sessionCookies
+  if type(cookies) ~= "table" and type(storage.sessionCookies) == "table" then
+    -- Legacy single-slot upgrade into the active map entry.
+    cookies = storage.sessionCookies
+    if entry then
+      entry.sessionCookies = cookies
+    end
+  end
+  if type(cookies) ~= "table" then
+    return
+  end
+  for name, value in pairs(cookies) do
+    session.sessionCookies[name] = value
+  end
+  MM.printStatus("MLP: Session-Cookies aus LocalStorage wiederhergestellt.")
 end
 
 function persistSessionCookies(storage)
-  if storage and session.sessionCookies then
-    storage.sessionCookies = session.sessionCookies
+  if not storage or not session.sessionCookies then
+    return
   end
+  local accountKey = storage.connectionAccountKey or ""
+  storage.connectionsByAccount = storage.connectionsByAccount or {}
+  local entry = storage.connectionsByAccount[accountKey]
+  if not entry then
+    entry = { connection = connection }
+    storage.connectionsByAccount[accountKey] = entry
+  end
+  entry.sessionCookies = session.sessionCookies
+  storage.sessionCookies = session.sessionCookies
 end
 
 function applySessionCookiesToConnection()

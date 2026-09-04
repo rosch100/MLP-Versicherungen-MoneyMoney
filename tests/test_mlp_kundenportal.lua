@@ -637,5 +637,43 @@ assertEq(
   nil,
   "calculateTotalContributions.omitsUnknownPurchasePrice")
 
+-- Multi-login: two accountKeys keep distinct connections and cookies
+do
+  local function newConn()
+    return {
+      language = "",
+      useragent = "test",
+      get = function() return nil end,
+      getCookies = function() return "" end,
+      setCookie = function() end,
+    }
+  end
+  Connection = newConn
+  LocalStorage = {}
+  restoreConnection("mlp-user-a")
+  local storedA = LocalStorage.connectionsByAccount["mlp-user-a"].connection
+  LocalStorage.connectionsByAccount["mlp-user-a"].sessionCookies = { VUSESSIONID = "A" }
+  restoreConnection("mlp-user-b")
+  local storedB = LocalStorage.connectionsByAccount["mlp-user-b"].connection
+  LocalStorage.connectionsByAccount["mlp-user-b"].sessionCookies = { VUSESSIONID = "B" }
+  assertEq(storedA ~= storedB, true, "multiLogin.map.distinct")
+  assertEq(
+    LocalStorage.connectionsByAccount["mlp-user-a"].sessionCookies.VUSESSIONID,
+    "A",
+    "multiLogin.cookies.userA")
+  assertEq(
+    LocalStorage.connectionsByAccount["mlp-user-b"].sessionCookies.VUSESSIONID,
+    "B",
+    "multiLogin.cookies.userB")
+  restoreConnection("mlp-user-a")
+  assertEq(LocalStorage.connection, storedA, "multiLogin.reusesUserA")
+  assertEq(LocalStorage.connectionAccountKey, "mlp-user-a", "multiLogin.activeKey.userA")
+  restorePersistedSessionCookies(LocalStorage, true)
+  assertEq(
+    LocalStorage.connectionsByAccount["mlp-user-a"].sessionCookies.VUSESSIONID,
+    "A",
+    "multiLogin.cookies.userA.afterRestore")
+end
+
 print()
 print("ALL TESTS PASSED")

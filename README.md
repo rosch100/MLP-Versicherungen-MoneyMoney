@@ -1,7 +1,7 @@
 # MLP Versicherungen — MoneyMoney Extension
 Plugin Homepage: https://github.com/rosch100/MLP-Versicherungen-MoneyMoney
 Bank/Portal: https://kundenportal.mlp.de
-Version: **0.91**
+Version: **0.92**
 Status: Beta — Cookie-Import; Username/Passwort (JWE mit OAEP-SHA-512/`aes256gcm`, sonst Klartext)
 Hub (gemeinsame Tools/Doku): https://github.com/rosch100/moneymoney-extensions
 Optional Cookie-Import: `COOKIE:VUSESSIONID=…` von vue.mlp.de (Details: Hub-README).
