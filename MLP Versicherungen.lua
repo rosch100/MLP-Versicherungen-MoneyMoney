@@ -3,11 +3,11 @@
 -- https://kundenportal.mlp.de
 -- API: https://moneymoney.app/api/webbanking/
 --
--- Authentifizierung: Cookie-Import (VUSESSIONID) — Beta 0.91
--- Version: 0.91 (Beta)
+-- Authentifizierung: Cookie-Import (VUSESSIONID) — Beta 0.92
+-- Version: 0.92 (Beta)
 
 WebBanking{
-  version     = 0.91,
+  version     = 0.92,
   url         = "https://kundenportal.mlp.de",
   services    = {"MLP Versicherungen"},
   description = "MLP Versicherungen — Beta (Cookie-Import)"
@@ -24,10 +24,16 @@ local CONSTANTS = {
   consentEndpoint   = "/services_auth/auth-backend/api/consent/execution",
   vueApiBase        = "https://vue.mlp.de",
   vueTokenEndpoint  = "/vu/api/token",
+  vueContractListPath = "/vu/api/contract/list",
   vueClientPath     = "/vu/client/index.html",
   portalVuApi       = "/api/app/vu",
   portalOkpLogin    = "/api/okp/login?backUrl=https://kundenportal.mlp.de/kunde",
-  mfaSessionExpired = "MFA-Session abgelaufen. Bitte neu einloggen."
+  mfaSessionExpired = "MFA-Session abgelaufen. Bitte neu einloggen.",
+  allowedHosts = {
+    "kundenportal.mlp.de",
+    "financepilot-pe.mlp.de",
+    "vue.mlp.de",
+  },
 }
 
 -- Globale (modulweite) Variablen müssen VOR den Funktionen deklariert werden
@@ -36,11 +42,49 @@ local session = {
   contracts = {},
   state = nil,
   username = nil,
-  password = nil,
   mfaToken = nil,
   sessionCookies = {},
   persistedConnection = false
 }
+
+function hostFromUrl(url)
+  if type(url) ~= "string" or url == "" then
+    return nil
+  end
+  local host = url:match("^https?://([^/]+)")
+  if not host then
+    return nil
+  end
+  host = host:lower():gsub(":443$", ""):gsub(":80$", "")
+  return host
+end
+
+function isAllowedMlpHost(host)
+  if not host or host == "" then
+    return false
+  end
+  host = host:lower()
+  for _, allowed in ipairs(CONSTANTS.allowedHosts) do
+    if host == allowed:lower() then
+      return true
+    end
+  end
+  return false
+end
+
+function assertAllowedMlpUrl(url)
+  if type(url) ~= "string" or url == "" then
+    return nil, "URL fehlt"
+  end
+  if not url:match("^https?://") then
+    return nil, "Nur absolute https://-URLs erlaubt"
+  end
+  local host = hostFromUrl(url)
+  if not isAllowedMlpHost(host) then
+    return nil, "Host nicht erlaubt: " .. tostring(host)
+  end
+  return url, nil
+end
 
 -- ============================================================================
 -- JWE / JOSE Kryptografie-Helper (basierend auf dokumentierten MM.* APIs)
@@ -264,8 +308,12 @@ function fetchOidcJwksUri()
 
   local parsed = parseJson(content)
   if parsed and type(parsed.jwks_uri) == "string" and parsed.jwks_uri ~= "" then
-    MM.printStatus("MLP-DEBUG: jwks_uri aus OIDC: " .. parsed.jwks_uri)
-    return parsed.jwks_uri
+    local allowed, allowErr = assertAllowedMlpUrl(parsed.jwks_uri)
+    if allowed then
+      MM.printStatus("MLP-DEBUG: jwks_uri aus OIDC (Allowlist OK)")
+      return allowed
+    end
+    MM.printStatus("MLP-DEBUG: jwks_uri abgelehnt: " .. tostring(allowErr))
   end
 
   return CONSTANTS.authBaseUrl .. CONSTANTS.jwksFallbackPath
@@ -356,7 +404,7 @@ function fetchPublicKey()
   local content = connection:request("GET", jwksUri, nil, nil, headers)
 
   if isAuthErrorPayload(content) then
-    MM.printStatus("MLP-DEBUG: JWKS-Antwort ist Fehler: " .. content:sub(1, math.min(100, #content)))
+    MM.printStatus("MLP-DEBUG: JWKS-Antwort ist Fehler (Status/Payload)")
     return nil
   end
 
@@ -527,7 +575,6 @@ function loginStep1(credentials, interactive)
   local canReuse, storage = restoreConnection(accountKey)
 
   session.username = username
-  session.password = password
   session.state = nil
   restorePersistedSessionCookies(storage, canReuse)
 
@@ -725,14 +772,22 @@ function extractIframeUrlFromPortalResponse(content)
 
   local iframeUrl = content:match('"iframeUrl"%s*:%s*"([^"]+)"')
   if iframeUrl then
-    return iframeUrl:gsub("\\/", "/")
+    iframeUrl = iframeUrl:gsub("\\/", "/")
+    local allowed = assertAllowedMlpUrl(iframeUrl)
+    return allowed
   end
 
   local appUrl = content:match('"appUrl"%s*:%s*"([^"]+)"')
   local token = content:match('"token"%s*:%s*"([^"]+)"')
   if appUrl and token then
     appUrl = appUrl:gsub("\\/", "/")
-    return appUrl .. "index.html?source=" .. urlEncode(CONSTANTS.baseUrl) .. "&token=" .. token
+    local allowedApp = assertAllowedMlpUrl(appUrl)
+    if not allowedApp then
+      return nil
+    end
+    local built = allowedApp .. "index.html?source=" .. urlEncode(CONSTANTS.baseUrl) .. "&token=" .. token
+    local allowedBuilt = assertAllowedMlpUrl(built)
+    return allowedBuilt
   end
 
   return nil
@@ -769,9 +824,14 @@ function establishVueSession(iframeUrl)
   if not iframeUrl or iframeUrl == "" then
     return false
   end
+  local allowed, allowErr = assertAllowedMlpUrl(iframeUrl)
+  if not allowed then
+    MM.printStatus("MLP: Vue-iframe URL abgelehnt: " .. tostring(allowErr))
+    return false
+  end
 
   MM.printStatus("MLP: Initialisiere Vue-Session...")
-  local clientContent = connection:get(iframeUrl)
+  local clientContent = connection:get(allowed)
   if clientContent then
     collectSessionCookies()
   end
@@ -1242,7 +1302,7 @@ function tryContractListAuth(cookieHeader)
     ["Content-Type"] = "application/json",
     ["Accept"] = "application/json, text/plain, */*",
     ["Accept-Language"] = "de-DE,de;q=0.9",
-    ["Referer"] = "https://vue.mlp.de/vu/client/",
+    ["Referer"] = CONSTANTS.vueApiBase .. "/vu/client/",
     ["Sec-Fetch-Site"] = "same-origin",
     ["Sec-Fetch-Mode"] = "cors",
     ["Sec-Fetch-Dest"] = "empty",
@@ -1253,14 +1313,14 @@ function tryContractListAuth(cookieHeader)
   end
 
   local success, contentOrError = pcall(function()
-    return connection:request("GET", "https://vue.mlp.de/vu/api/contract/list", nil, nil, headers)
+    return connection:request("GET", CONSTANTS.vueApiBase .. CONSTANTS.vueContractListPath, nil, nil, headers)
   end)
 
   if success and contentOrError then
     if contentOrError:find("403") or contentOrError:find("error") or contentOrError:find("<!doctype") then
       if tryConsentCall() then
         success, contentOrError = pcall(function()
-          return connection:request("GET", "https://vue.mlp.de/vu/api/contract/list", nil, nil, headers)
+          return connection:request("GET", CONSTANTS.vueApiBase .. CONSTANTS.vueContractListPath, nil, nil, headers)
         end)
       end
     end
@@ -1271,7 +1331,7 @@ function tryContractListAuth(cookieHeader)
     end
   elseif tryConsentCall() then
     success, contentOrError = pcall(function()
-      return connection:request("GET", "https://vue.mlp.de/vu/api/contract/list", nil, nil, headers)
+      return connection:request("GET", CONSTANTS.vueApiBase .. CONSTANTS.vueContractListPath, nil, nil, headers)
     end)
     if success and contentOrError then
       local data = parseJson(contentOrError)
@@ -1304,7 +1364,7 @@ function loadContracts()
     ["Content-Type"] = "application/json",
     ["Accept"] = "application/json, text/plain, */*",
     ["Accept-Language"] = "de-DE,de;q=0.9",
-    ["Referer"] = "https://vue.mlp.de/vu/client/",
+    ["Referer"] = CONSTANTS.vueApiBase .. "/vu/client/",
     ["Sec-Fetch-Site"] = "same-origin",
     ["Sec-Fetch-Mode"] = "cors",
     ["Sec-Fetch-Dest"] = "empty",
@@ -1315,21 +1375,21 @@ function loadContracts()
   end
 
   local success, content = pcall(function()
-    return connection:request("GET", "https://vue.mlp.de/vu/api/contract/list", nil, nil, headers)
+    return connection:request("GET", CONSTANTS.vueApiBase .. CONSTANTS.vueContractListPath, nil, nil, headers)
   end)
 
   if success and content then
     if content:find("403") or content:find("error") or content:find("<!doctype") then
       if tryConsentCall() then
         success, content = pcall(function()
-          return connection:request("GET", "https://vue.mlp.de/vu/api/contract/list", nil, nil, headers)
+          return connection:request("GET", CONSTANTS.vueApiBase .. CONSTANTS.vueContractListPath, nil, nil, headers)
         end)
       end
     end
   elseif not success or not content then
     if tryConsentCall() then
       success, content = pcall(function()
-        return connection:request("GET", "https://vue.mlp.de/vu/api/contract/list", nil, nil, headers)
+        return connection:request("GET", CONSTANTS.vueApiBase .. CONSTANTS.vueContractListPath, nil, nil, headers)
       end)
     end
   end
@@ -1687,18 +1747,13 @@ function parseJson(jsonStr)
   if not jsonStr or jsonStr == "" then return nil end
   jsonStr = trim(jsonStr)
   if not jsonStr:match("^[%{%[]") then return nil end
-  if JSON then
-    local success, result = pcall(function() return JSON(jsonStr):dictionary() end)
-    if success and result then return result end
-    success, result = pcall(function() return JSON(jsonStr):array() end)
-    if success and result then return result end
+  if not JSON then
+    return nil
   end
-  local normalized = jsonStr:gsub('"([^"]+)":', '["%1"] = '):gsub("%[", "{"):gsub("%]", "}"):gsub("true", "true"):gsub("false", "false"):gsub("null", "nil")
-  local func = load("return " .. normalized, "json", "t", {})
-  if func then
-    local success, result = pcall(func)
-    if success and type(result) == "table" then return result end
-  end
+  local success, result = pcall(function() return JSON(jsonStr):dictionary() end)
+  if success and result then return result end
+  success, result = pcall(function() return JSON(jsonStr):array() end)
+  if success and result then return result end
   return nil
 end
 
