@@ -68,7 +68,7 @@ function hostFromUrl(url)
   if type(url) ~= "string" or url == "" then
     return nil
   end
-  local host = url:match("^https?://([^/]+)")
+  local host = url:match("^https?://([^/?#]+)")
   if not host then
     return nil
   end
