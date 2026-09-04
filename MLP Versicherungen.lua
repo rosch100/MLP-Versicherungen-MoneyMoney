@@ -47,6 +47,23 @@ local session = {
   persistedConnection = false
 }
 
+local function isMlpDebugEnabled()
+  local storage = rawget(_G, "LocalStorage")
+  return storage ~= nil and storage.mlpDebug == true
+end
+
+function mlpDebugLog(message)
+  if not isMlpDebugEnabled() then
+    return
+  end
+  if type(message) ~= "string" or message == "" then
+    return
+  end
+  if MM and type(MM.printStatus) == "function" then
+    MM.printStatus(message)
+  end
+end
+
 function hostFromUrl(url)
   if type(url) ~= "string" or url == "" then
     return nil
@@ -76,7 +93,7 @@ function assertAllowedMlpUrl(url)
   if type(url) ~= "string" or url == "" then
     return nil, "URL fehlt"
   end
-  if not url:match("^https?://") then
+  if not url:match("^https://") then
     return nil, "Nur absolute https://-URLs erlaubt"
   end
   local host = hostFromUrl(url)
@@ -177,15 +194,15 @@ function aesGcmEncrypt(key, iv, plaintext, aad)
 end
 
 function generateJwe(payload, publicKey)
-  MM.printStatus("MLP-DEBUG: generateJwe startet, prüfe Krypto-Funktionen...")
+  mlpDebugLog("MLP-DEBUG: generateJwe startet, prüfe Krypto-Funktionen...")
   if not (type(MM.random) == "function" and
           type(MM.base64urlencode) == "function" and
           type(MM.rsaEncrypt) == "function") then
-    MM.printStatus("MLP-DEBUG: Fehlende Krypto-Funktionen!")
+    mlpDebugLog("MLP-DEBUG: Fehlende Krypto-Funktionen!")
     return nil, "Kryptografische Funktionen nicht verfügbar. Cookie-Import erforderlich."
   end
   if not canUseA256Gcm() then
-    MM.printStatus("MLP-DEBUG: MM.aes256gcm nicht verfügbar!")
+    mlpDebugLog("MLP-DEBUG: MM.aes256gcm nicht verfügbar!")
     return nil, "A256GCM nicht verfügbar (MM.aes256gcm fehlt). Cookie-Import erforderlich."
   end
 
@@ -208,7 +225,7 @@ function generateJwe(payload, publicKey)
 
   local encryptedKey = encryptCekWithRsa(cek, publicKey)
   if not encryptedKey then
-    MM.printStatus("MLP-DEBUG: encryptCekWithRsa lieferte nil")
+    mlpDebugLog("MLP-DEBUG: encryptCekWithRsa lieferte nil")
     return nil, "CEK-Verschlüsselung mit RSA-OAEP-512 fehlgeschlagen"
   end
 
@@ -222,7 +239,7 @@ function generateJwe(payload, publicKey)
 end
 
 function encryptCekWithRsa(cek, publicKey)
-  MM.printStatus("MLP-DEBUG: encryptCekWithRsa startet, publicKey Typ=" .. type(publicKey))
+  mlpDebugLog("MLP-DEBUG: encryptCekWithRsa startet, publicKey Typ=" .. type(publicKey))
 
   if type(MM.rsaEncrypt) ~= "function" then
     return nil
@@ -238,13 +255,13 @@ function encryptCekWithRsa(cek, publicKey)
   end
 
   if type(keyTable) ~= "table" then
-    MM.printStatus("MLP-DEBUG: keyTable ist kein table, Typ=" .. type(keyTable))
+    mlpDebugLog("MLP-DEBUG: keyTable ist kein table, Typ=" .. type(keyTable))
     return nil
   end
 
   local paddingSpecs = { "pkcs1-oaep sha512", "pkcs1-oaep sha256" }
   for _, paddingSpec in ipairs(paddingSpecs) do
-    MM.printStatus("MLP-DEBUG: Versuche rsaEncrypt mit " .. paddingSpec .. "...")
+    mlpDebugLog("MLP-DEBUG: Versuche rsaEncrypt mit " .. paddingSpec .. "...")
     local ok, encryptedKey = pcall(function()
       return MM.rsaEncrypt(keyTable, cek, paddingSpec)
     end)
@@ -298,11 +315,11 @@ end
 function fetchOidcJwksUri()
   local headers = jsonRequestHeaders()
   local configUrl = CONSTANTS.authBaseUrl .. CONSTANTS.oidcConfigPath
-  MM.printStatus("MLP-DEBUG: Lade OIDC-Konfiguration: " .. configUrl)
+  mlpDebugLog("MLP-DEBUG: Lade OIDC-Konfiguration: " .. configUrl)
 
   local content = connection:request("GET", configUrl, nil, nil, headers)
   if isAuthErrorPayload(content) then
-    MM.printStatus("MLP-DEBUG: OIDC-Konfiguration nicht verfügbar")
+    mlpDebugLog("MLP-DEBUG: OIDC-Konfiguration nicht verfügbar")
     return CONSTANTS.authBaseUrl .. CONSTANTS.jwksFallbackPath
   end
 
@@ -310,10 +327,10 @@ function fetchOidcJwksUri()
   if parsed and type(parsed.jwks_uri) == "string" and parsed.jwks_uri ~= "" then
     local allowed, allowErr = assertAllowedMlpUrl(parsed.jwks_uri)
     if allowed then
-      MM.printStatus("MLP-DEBUG: jwks_uri aus OIDC (Allowlist OK)")
+      mlpDebugLog("MLP-DEBUG: jwks_uri aus OIDC (Allowlist OK)")
       return allowed
     end
-    MM.printStatus("MLP-DEBUG: jwks_uri abgelehnt: " .. tostring(allowErr))
+    mlpDebugLog("MLP-DEBUG: jwks_uri abgelehnt: " .. tostring(allowErr))
   end
 
   return CONSTANTS.authBaseUrl .. CONSTANTS.jwksFallbackPath
@@ -351,7 +368,7 @@ function extractPublicKeyFromJwks(jwks)
   end
 
   session.publicKeyKid = jwk.kid or "default"
-  MM.printStatus("MLP-DEBUG: enc-JWK gewählt, kid=" .. tostring(jwk.kid) .. ", kty=" .. tostring(jwk.kty))
+  mlpDebugLog("MLP-DEBUG: enc-JWK gewählt, kid=" .. tostring(jwk.kid) .. ", kty=" .. tostring(jwk.kty))
   return extractPublicKeyFromJwk(jwk)
 end
 
@@ -393,28 +410,28 @@ function fetchPublicKey()
   MM.printStatus("MLP: Lade öffentlichen Schlüssel für JWE...")
 
   if not connection then
-    MM.printStatus("MLP-DEBUG: connection ist nil!")
+    mlpDebugLog("MLP-DEBUG: connection ist nil!")
     return nil
   end
 
   local jwksUri = fetchOidcJwksUri()
   local headers = jsonRequestHeaders()
 
-  MM.printStatus("MLP-DEBUG: Lade JWKS: " .. jwksUri)
+  mlpDebugLog("MLP-DEBUG: Lade JWKS: " .. jwksUri)
   local content = connection:request("GET", jwksUri, nil, nil, headers)
 
   if isAuthErrorPayload(content) then
-    MM.printStatus("MLP-DEBUG: JWKS-Antwort ist Fehler (Status/Payload)")
+    mlpDebugLog("MLP-DEBUG: JWKS-Antwort ist Fehler (Status/Payload)")
     return nil
   end
 
   local publicKey = parseJwksContent(content)
   if publicKey then
-    MM.printStatus("MLP-DEBUG: Public Key erfolgreich aus JWKS extrahiert")
+    mlpDebugLog("MLP-DEBUG: Public Key erfolgreich aus JWKS extrahiert")
     return publicKey
   end
 
-  MM.printStatus("MLP-DEBUG: Kein enc-RSA-Key im JWKS gefunden")
+  mlpDebugLog("MLP-DEBUG: Kein enc-RSA-Key im JWKS gefunden")
   return nil
 end
 
@@ -894,13 +911,13 @@ end
 
 function performJweLogin(username, password)
   -- 1. Hole Public Key für RSA-Verschlüsselung
-  MM.printStatus("MLP-DEBUG: performJweLogin startet")
+  mlpDebugLog("MLP-DEBUG: performJweLogin startet")
   local publicKey = fetchPublicKey()
   if not publicKey then
     MM.printStatus("MLP: Kein Public Key verfügbar, fallback zu Cookie-Import...")
     return { success = false, error = "JOSE", needsCookie = true }
   end
-  MM.printStatus("MLP-DEBUG: Public Key erfolgreich geholt, Typ=" .. type(publicKey))
+  mlpDebugLog("MLP-DEBUG: Public Key erfolgreich geholt, Typ=" .. type(publicKey))
 
   -- 2. Bereite Login-Payload vor
   local loginPayload = {
@@ -914,13 +931,13 @@ function performJweLogin(username, password)
   }
 
   -- 3. Generiere JWE
-  MM.printStatus("MLP-DEBUG: Generiere JWE mit PublicKey...")
+  mlpDebugLog("MLP-DEBUG: Generiere JWE mit PublicKey...")
   local jwe, errorMsg = generateJwe(loginPayload, publicKey)
   if not jwe then
     MM.printStatus("MLP: JWE-Generierung fehlgeschlagen: " .. (errorMsg or "Unbekannter Fehler"))
     return { success = false, error = "JOSE", needsCookie = true }
   end
-  MM.printStatus("MLP-DEBUG: JWE erfolgreich generiert, Länge=" .. #jwe)
+  mlpDebugLog("MLP-DEBUG: JWE erfolgreich generiert, Länge=" .. #jwe)
 
   MM.printStatus("MLP: JWE generiert, sende Authentifizierung...")
 
