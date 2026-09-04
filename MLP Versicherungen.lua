@@ -3,11 +3,11 @@
 -- https://kundenportal.mlp.de
 -- API: https://moneymoney.app/api/webbanking/
 --
--- Authentifizierung: Cookie-Import (VUSESSIONID) — Beta 0.92
--- Version: 0.92 (Beta)
+-- Authentifizierung: Cookie-Import (VUSESSIONID) — Beta 0.91
+-- Version: 0.91 (Beta)
 
 WebBanking{
-  version     = 0.92,
+  version     = 0.91,
   url         = "https://kundenportal.mlp.de",
   services    = {"MLP Versicherungen"},
   description = "MLP Versicherungen — Beta (Cookie-Import)"
