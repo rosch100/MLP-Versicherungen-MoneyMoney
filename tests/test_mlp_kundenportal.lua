@@ -400,6 +400,28 @@ local jsonStr = encodeJson(testObj)
 assertContains(jsonStr, "name", "encodeJson.hasName")
 assertContains(jsonStr, "Test", "encodeJson.hasValue")
 
+-- Ohne JWE-APIs bleibt Username/Passwort aktiv (Klartext), kein stiller Cookie-Only-Skip.
+do
+  local plaintextCalled = false
+  local realPlaintext = performPlaintextLogin
+  performPlaintextLogin = function(username, password)
+    plaintextCalled = true
+    assertEq(username, "mlp-user", "performLogin.plaintextFallback.username")
+    assertEq(password, "secret", "performLogin.plaintextFallback.password")
+    return { success = false, error = "JOSE", needsCookie = true }
+  end
+  MM.random = nil
+  MM.aes256gcm = nil
+  MM.aesgcm = nil
+  MM.rsaEncrypt = nil
+  MM.base64urlencode = nil
+  local result = performLogin("mlp-user", "secret")
+  performPlaintextLogin = realPlaintext
+  assertEq(plaintextCalled, true, "performLogin.plaintextFallback.called")
+  assertEq(type(result), "table", "performLogin.plaintextFallback.result")
+  assertEq(result.needsCookie, true, "performLogin.plaintextFallback.needsCookie")
+end
+
 local missingMfaState = InitializeSession2(
   ProtocolWebBanking,
   "MLP Versicherungen",

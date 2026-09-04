@@ -131,27 +131,6 @@ function generateRandomBytes(length)
   error("MLP Versicherungen: MM.random ist für kryptografisch sichere Zufallsdaten erforderlich.")
 end
 
-function aes256Encrypt(key, iv, plaintext)
-  if type(MM.aes256encrypt) == "function" then
-    return MM.aes256encrypt(key, iv, plaintext)
-  end
-  return nil
-end
-
-function aes256Decrypt(key, iv, ciphertext)
-  if type(MM.aes256decrypt) == "function" then
-    return MM.aes256decrypt(key, iv, ciphertext)
-  end
-  return nil
-end
-
-function hmac256(key, data)
-  if type(MM.hmac256) == "function" then
-    return MM.hmac256(key, data)
-  end
-  return nil
-end
-
 function sha256(data)
   if type(MM.sha256) == "function" then
     return MM.sha256(data)
@@ -712,12 +691,9 @@ function performLogin(username, password)
     return performJweLogin(username, password)
   end
 
-  MM.printStatus("MLP: JWE-Krypto-APIs nicht verfügbar (MM.aes256gcm fehlt).")
-  return {
-    success = false,
-    error = "JOSE",
-    needsCookie = true
-  }
+  -- Username/Passwort bleibt auch ohne JWE-APIs: Klartext versuchen, sonst Cookie.
+  MM.printStatus("MLP: JWE-Krypto-APIs nicht verfügbar — Klartext-Login...")
+  return performPlaintextLogin(username, password)
 end
 
 function isEmptyLoginSuccess(content)
@@ -992,7 +968,6 @@ function performJweLogin(username, password)
 end
 
 function performPlaintextLogin(username, password)
-  -- Fallback: Klartext-Login (wird meist vom Server abgelehnt, aber versuchen)
   local loginPayload = {
     username = username,
     password = password,
