@@ -146,6 +146,15 @@ function canUseA256Gcm()
   return type(MM.aes256gcm) == "function" or type(MM.aesgcm) == "function"
 end
 
+--- True when MoneyMoney exposes the APIs needed to build MLP JWE locally.
+--- RSA-OAEP-SHA-512 is enforced at encrypt time (no SHA-256 under RSA-OAEP-512 header).
+function canUseJweLogin()
+  return type(MM.random) == "function"
+    and type(MM.base64urlencode) == "function"
+    and type(MM.rsaEncrypt) == "function"
+    and canUseA256Gcm()
+end
+
 function aesGcmEncrypt(key, iv, plaintext, aad)
   if type(MM.aes256gcm) == "function" then
     local ok, ciphertext, tag = pcall(function()
@@ -238,15 +247,17 @@ function encryptCekWithRsa(cek, publicKey)
     return nil
   end
 
-  local paddingSpecs = { "pkcs1-oaep sha512", "pkcs1-oaep sha256" }
-  for _, paddingSpec in ipairs(paddingSpecs) do
-    mlpDebugLog("MLP-DEBUG: Versuche rsaEncrypt mit " .. paddingSpec .. "...")
-    local ok, encryptedKey = pcall(function()
-      return MM.rsaEncrypt(keyTable, cek, paddingSpec)
-    end)
-    if ok and type(encryptedKey) == "string" and encryptedKey ~= "" then
-      return encryptedKey
-    end
+  -- Header alg is RSA-OAEP-512: only matching OAEP-SHA-512 padding (no SHA-256 fallback).
+  local paddingSpec = "pkcs1-oaep sha512"
+  mlpDebugLog("MLP-DEBUG: Versuche rsaEncrypt mit " .. paddingSpec .. "...")
+  local ok, encryptedKey = pcall(function()
+    return MM.rsaEncrypt(keyTable, cek, paddingSpec)
+  end)
+  if ok and type(encryptedKey) == "string" and encryptedKey ~= "" then
+    return encryptedKey
+  end
+  if not ok then
+    mlpDebugLog("MLP-DEBUG: rsaEncrypt OAEP-SHA-512 fehlgeschlagen: " .. tostring(encryptedKey))
   end
 
   return nil
@@ -681,14 +692,17 @@ function tryCookieAuth()
 end
 
 function performLogin(username, password)
-  local canUseJwe = type(MM.random) == "function" and
-                    type(MM.base64urlencode) == "function" and
-                    type(MM.rsaEncrypt) == "function" and
-                    canUseA256Gcm()
-
-  if canUseJwe then
+  if canUseJweLogin() then
     MM.printStatus("MLP: Versuche JWE-verschlüsselten Login...")
-    return performJweLogin(username, password)
+    local jweResult = performJweLogin(username, password)
+    if jweResult.success or jweResult.requiresMfa then
+      return jweResult
+    end
+    if jweResult.cryptoIncomplete then
+      MM.printStatus("MLP: JWE-Krypto unvollständig — Klartext-Login...")
+      return performPlaintextLogin(username, password)
+    end
+    return jweResult
   end
 
   -- Username/Passwort bleibt auch ohne JWE-APIs: Klartext versuchen, sonst Cookie.
@@ -911,7 +925,11 @@ function performJweLogin(username, password)
   local jwe, errorMsg = generateJwe(loginPayload, publicKey)
   if not jwe then
     MM.printStatus("MLP: JWE-Generierung fehlgeschlagen: " .. (errorMsg or "Unbekannter Fehler"))
-    return { success = false, error = "JOSE", needsCookie = true }
+    return {
+      success = false,
+      error = errorMsg or "JOSE",
+      cryptoIncomplete = true,
+    }
   end
   mlpDebugLog("MLP-DEBUG: JWE erfolgreich generiert, Länge=" .. #jwe)
 
