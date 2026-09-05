@@ -400,6 +400,71 @@ local jsonStr = encodeJson(testObj)
 assertContains(jsonStr, "name", "encodeJson.hasName")
 assertContains(jsonStr, "Test", "encodeJson.hasValue")
 
+-- Ohne JWE-APIs bleibt Username/Passwort aktiv (Klartext), kein stiller Cookie-Only-Skip.
+do
+  local plaintextCalled = false
+  local realPlaintext = performPlaintextLogin
+  performPlaintextLogin = function(username, password)
+    plaintextCalled = true
+    assertEq(username, "mlp-user", "performLogin.plaintextFallback.username")
+    assertEq(password, "secret", "performLogin.plaintextFallback.password")
+    return { success = false, error = "JOSE", needsCookie = true }
+  end
+  MM.random = nil
+  MM.aes256gcm = nil
+  MM.aesgcm = nil
+  MM.rsaEncrypt = nil
+  MM.base64urlencode = nil
+  local result = performLogin("mlp-user", "secret")
+  performPlaintextLogin = realPlaintext
+  assertEq(plaintextCalled, true, "performLogin.plaintextFallback.called")
+  assertEq(type(result), "table", "performLogin.plaintextFallback.result")
+  assertEq(result.needsCookie, true, "performLogin.plaintextFallback.needsCookie")
+end
+
+-- JWE CEK: nur OAEP-SHA-512 (Header alg RSA-OAEP-512), kein SHA-256-Fallback.
+do
+  local seenPadding = {}
+  MM.rsaEncrypt = function(_key, _cek, padding)
+    seenPadding[#seenPadding + 1] = padding
+    if padding == "pkcs1-oaep sha256" then
+      return "wrong-padding-must-not-be-used"
+    end
+    if padding == "pkcs1-oaep sha512" then
+      return "cek-encrypted-sha512"
+    end
+    error("unsupported padding")
+  end
+  local encrypted = encryptCekWithRsa(string.rep("A", 32), { n = "01", e = "010001" })
+  assertEq(encrypted, "cek-encrypted-sha512", "encryptCekWithRsa.sha512")
+  assertEq(#seenPadding, 1, "encryptCekWithRsa.singleAttempt")
+  assertEq(seenPadding[1], "pkcs1-oaep sha512", "encryptCekWithRsa.padding")
+end
+
+-- Wenn JWE-APIs da sind, aber Generierung cryptoIncomplete → Klartext-Fallback.
+do
+  local plaintextCalled = false
+  local realPlaintext = performPlaintextLogin
+  local realJwe = performJweLogin
+  performJweLogin = function()
+    return { success = false, error = "CEK-Verschlüsselung mit RSA-OAEP-512 fehlgeschlagen", cryptoIncomplete = true }
+  end
+  performPlaintextLogin = function()
+    plaintextCalled = true
+    return { success = false, error = "JOSE", needsCookie = true }
+  end
+  MM.random = function(n) return string.rep("\0", n) end
+  MM.base64urlencode = function(s) return "b64u" end
+  MM.rsaEncrypt = function() return "x" end
+  MM.aes256gcm = function() return "ct", "tag" end
+  assertEq(canUseJweLogin(), true, "canUseJweLogin.whenApisPresent")
+  local result = performLogin("mlp-user", "secret")
+  performPlaintextLogin = realPlaintext
+  performJweLogin = realJwe
+  assertEq(plaintextCalled, true, "performLogin.cryptoIncomplete.fallsBackToPlaintext")
+  assertEq(result.needsCookie, true, "performLogin.cryptoIncomplete.plaintextResult")
+end
+
 local missingMfaState = InitializeSession2(
   ProtocolWebBanking,
   "MLP Versicherungen",
@@ -571,6 +636,44 @@ assertEq(
   calculateTotalContributions({}),
   nil,
   "calculateTotalContributions.omitsUnknownPurchasePrice")
+
+-- Multi-login: two accountKeys keep distinct connections and cookies
+do
+  local function newConn()
+    return {
+      language = "",
+      useragent = "test",
+      get = function() return nil end,
+      getCookies = function() return "" end,
+      setCookie = function() end,
+    }
+  end
+  Connection = newConn
+  LocalStorage = {}
+  restoreConnection("mlp-user-a")
+  local storedA = LocalStorage.connectionsByAccount["mlp-user-a"].connection
+  LocalStorage.connectionsByAccount["mlp-user-a"].sessionCookies = { VUSESSIONID = "A" }
+  restoreConnection("mlp-user-b")
+  local storedB = LocalStorage.connectionsByAccount["mlp-user-b"].connection
+  LocalStorage.connectionsByAccount["mlp-user-b"].sessionCookies = { VUSESSIONID = "B" }
+  assertEq(storedA ~= storedB, true, "multiLogin.map.distinct")
+  assertEq(
+    LocalStorage.connectionsByAccount["mlp-user-a"].sessionCookies.VUSESSIONID,
+    "A",
+    "multiLogin.cookies.userA")
+  assertEq(
+    LocalStorage.connectionsByAccount["mlp-user-b"].sessionCookies.VUSESSIONID,
+    "B",
+    "multiLogin.cookies.userB")
+  restoreConnection("mlp-user-a")
+  assertEq(LocalStorage.connection, storedA, "multiLogin.reusesUserA")
+  assertEq(LocalStorage.connectionAccountKey, "mlp-user-a", "multiLogin.activeKey.userA")
+  restorePersistedSessionCookies(LocalStorage, true)
+  assertEq(
+    LocalStorage.connectionsByAccount["mlp-user-a"].sessionCookies.VUSESSIONID,
+    "A",
+    "multiLogin.cookies.userA.afterRestore")
+end
 
 print()
 print("ALL TESTS PASSED")

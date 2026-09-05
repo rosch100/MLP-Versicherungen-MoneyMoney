@@ -7,7 +7,7 @@
 -- Version: 0.91 (Beta)
 
 WebBanking{
-  version     = 0.91,
+  version     = 0.92,
   url         = "https://kundenportal.mlp.de",
   services    = {"MLP Versicherungen"},
   description = "MLP Versicherungen — Beta (Cookie-Import)"
@@ -131,27 +131,6 @@ function generateRandomBytes(length)
   error("MLP Versicherungen: MM.random ist für kryptografisch sichere Zufallsdaten erforderlich.")
 end
 
-function aes256Encrypt(key, iv, plaintext)
-  if type(MM.aes256encrypt) == "function" then
-    return MM.aes256encrypt(key, iv, plaintext)
-  end
-  return nil
-end
-
-function aes256Decrypt(key, iv, ciphertext)
-  if type(MM.aes256decrypt) == "function" then
-    return MM.aes256decrypt(key, iv, ciphertext)
-  end
-  return nil
-end
-
-function hmac256(key, data)
-  if type(MM.hmac256) == "function" then
-    return MM.hmac256(key, data)
-  end
-  return nil
-end
-
 function sha256(data)
   if type(MM.sha256) == "function" then
     return MM.sha256(data)
@@ -165,6 +144,15 @@ end
 
 function canUseA256Gcm()
   return type(MM.aes256gcm) == "function" or type(MM.aesgcm) == "function"
+end
+
+--- True when MoneyMoney exposes the APIs needed to build MLP JWE locally.
+--- RSA-OAEP-SHA-512 is enforced at encrypt time (no SHA-256 under RSA-OAEP-512 header).
+function canUseJweLogin()
+  return type(MM.random) == "function"
+    and type(MM.base64urlencode) == "function"
+    and type(MM.rsaEncrypt) == "function"
+    and canUseA256Gcm()
 end
 
 function aesGcmEncrypt(key, iv, plaintext, aad)
@@ -259,15 +247,17 @@ function encryptCekWithRsa(cek, publicKey)
     return nil
   end
 
-  local paddingSpecs = { "pkcs1-oaep sha512", "pkcs1-oaep sha256" }
-  for _, paddingSpec in ipairs(paddingSpecs) do
-    mlpDebugLog("MLP-DEBUG: Versuche rsaEncrypt mit " .. paddingSpec .. "...")
-    local ok, encryptedKey = pcall(function()
-      return MM.rsaEncrypt(keyTable, cek, paddingSpec)
-    end)
-    if ok and type(encryptedKey) == "string" and encryptedKey ~= "" then
-      return encryptedKey
-    end
+  -- Header alg is RSA-OAEP-512: only matching OAEP-SHA-512 padding (no SHA-256 fallback).
+  local paddingSpec = "pkcs1-oaep sha512"
+  mlpDebugLog("MLP-DEBUG: Versuche rsaEncrypt mit " .. paddingSpec .. "...")
+  local ok, encryptedKey = pcall(function()
+    return MM.rsaEncrypt(keyTable, cek, paddingSpec)
+  end)
+  if ok and type(encryptedKey) == "string" and encryptedKey ~= "" then
+    return encryptedKey
+  end
+  if not ok then
+    mlpDebugLog("MLP-DEBUG: rsaEncrypt OAEP-SHA-512 fehlgeschlagen: " .. tostring(encryptedKey))
   end
 
   return nil
@@ -495,48 +485,82 @@ end
 
 function restoreConnection(accountKey)
   local storage = rawget(_G, "LocalStorage")
-  local canReuse =
-    storage and storage.connection and storage.connectionAccountKey == accountKey
+  accountKey = accountKey or ""
+  local canReuse = false
 
-  if canReuse then
-    connection = storage.connection
-    session.persistedConnection = true
-    MM.printStatus("MLP: Persistierte Connection wiederverwendet.")
+  if storage then
+    storage.connectionsByAccount = storage.connectionsByAccount or {}
+    local entry = storage.connectionsByAccount[accountKey]
+    -- Active single-slot is authoritative when the accountKey matches (legacy + tests).
+    if storage.connection ~= nil and storage.connectionAccountKey == accountKey then
+      entry = entry or {}
+      entry.connection = storage.connection
+      if type(storage.sessionCookies) == "table" and entry.sessionCookies == nil then
+        entry.sessionCookies = storage.sessionCookies
+      end
+      storage.connectionsByAccount[accountKey] = entry
+    end
+    canReuse = entry ~= nil and entry.connection ~= nil
+    if canReuse then
+      connection = entry.connection
+      session.persistedConnection = true
+      MM.printStatus("MLP: Persistierte Connection wiederverwendet.")
+    else
+      connection = Connection()
+      storage.connectionsByAccount[accountKey] = { connection = connection }
+      session.persistedConnection = true
+    end
+    storage.connection = connection
+    storage.connectionAccountKey = accountKey
   else
     connection = Connection()
-    if storage then
-      storage.connection = connection
-      storage.connectionAccountKey = accountKey
-      session.persistedConnection = true
-    else
-      session.persistedConnection = false
-    end
+    session.persistedConnection = false
   end
 
   connection.language = "de-DE"
-  if type(Connection) == "function" then
-    connection.useragent = Connection().useragent or CONSTANTS.userAgent
-  else
-    connection.useragent = CONSTANTS.userAgent
-  end
+  connection.useragent = CONSTANTS.userAgent
 
   return canReuse, storage
 end
 
 function restorePersistedSessionCookies(storage, canReuse)
   session.sessionCookies = {}
-  if canReuse and storage and type(storage.sessionCookies) == "table" then
-    for name, value in pairs(storage.sessionCookies) do
-      session.sessionCookies[name] = value
-    end
-    MM.printStatus("MLP: Session-Cookies aus LocalStorage wiederhergestellt.")
+  if not canReuse or not storage then
+    return
   end
+  local accountKey = storage.connectionAccountKey or ""
+  local entry = storage.connectionsByAccount
+    and storage.connectionsByAccount[accountKey]
+  local cookies = entry and entry.sessionCookies
+  if type(cookies) ~= "table" and type(storage.sessionCookies) == "table" then
+    -- Legacy single-slot upgrade into the active map entry.
+    cookies = storage.sessionCookies
+    if entry then
+      entry.sessionCookies = cookies
+    end
+  end
+  if type(cookies) ~= "table" then
+    return
+  end
+  for name, value in pairs(cookies) do
+    session.sessionCookies[name] = value
+  end
+  MM.printStatus("MLP: Session-Cookies aus LocalStorage wiederhergestellt.")
 end
 
 function persistSessionCookies(storage)
-  if storage and session.sessionCookies then
-    storage.sessionCookies = session.sessionCookies
+  if not storage or not session.sessionCookies then
+    return
   end
+  local accountKey = storage.connectionAccountKey or ""
+  storage.connectionsByAccount = storage.connectionsByAccount or {}
+  local entry = storage.connectionsByAccount[accountKey]
+  if not entry then
+    entry = { connection = connection }
+    storage.connectionsByAccount[accountKey] = entry
+  end
+  entry.sessionCookies = session.sessionCookies
+  storage.sessionCookies = session.sessionCookies
 end
 
 function applySessionCookiesToConnection()
@@ -702,22 +726,22 @@ function tryCookieAuth()
 end
 
 function performLogin(username, password)
-  local canUseJwe = type(MM.random) == "function" and
-                    type(MM.base64urlencode) == "function" and
-                    type(MM.rsaEncrypt) == "function" and
-                    canUseA256Gcm()
-
-  if canUseJwe then
+  if canUseJweLogin() then
     MM.printStatus("MLP: Versuche JWE-verschlüsselten Login...")
-    return performJweLogin(username, password)
+    local jweResult = performJweLogin(username, password)
+    if jweResult.success or jweResult.requiresMfa then
+      return jweResult
+    end
+    if jweResult.cryptoIncomplete then
+      MM.printStatus("MLP: JWE-Krypto unvollständig — Klartext-Login...")
+      return performPlaintextLogin(username, password)
+    end
+    return jweResult
   end
 
-  MM.printStatus("MLP: JWE-Krypto-APIs nicht verfügbar (MM.aes256gcm fehlt).")
-  return {
-    success = false,
-    error = "JOSE",
-    needsCookie = true
-  }
+  -- Username/Passwort bleibt auch ohne JWE-APIs: Klartext versuchen, sonst Cookie.
+  MM.printStatus("MLP: JWE-Krypto-APIs nicht verfügbar — Klartext-Login...")
+  return performPlaintextLogin(username, password)
 end
 
 function isEmptyLoginSuccess(content)
@@ -935,7 +959,11 @@ function performJweLogin(username, password)
   local jwe, errorMsg = generateJwe(loginPayload, publicKey)
   if not jwe then
     MM.printStatus("MLP: JWE-Generierung fehlgeschlagen: " .. (errorMsg or "Unbekannter Fehler"))
-    return { success = false, error = "JOSE", needsCookie = true }
+    return {
+      success = false,
+      error = errorMsg or "JOSE",
+      cryptoIncomplete = true,
+    }
   end
   mlpDebugLog("MLP-DEBUG: JWE erfolgreich generiert, Länge=" .. #jwe)
 
@@ -992,7 +1020,6 @@ function performJweLogin(username, password)
 end
 
 function performPlaintextLogin(username, password)
-  -- Fallback: Klartext-Login (wird meist vom Server abgelehnt, aber versuchen)
   local loginPayload = {
     username = username,
     password = password,
