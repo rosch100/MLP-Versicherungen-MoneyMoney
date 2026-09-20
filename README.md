@@ -34,6 +34,12 @@ Passwortfeld). Cookie-Ablauf:
 Nach dem Einrichten den Zugang aktualisieren. Bei Cookie-Anmeldung Session bei
 Bedarf erneuern.
 
+## Fehler & Ideen
+
+Issues bitte über GitHub melden:
+[Neues Issue](https://github.com/rosch100/MLP-Versicherungen-MoneyMoney/issues/new/choose).
+Keine MoneyMoney-Logdateien anhängen — Details stehen im Bug-Formular.
+
 ## Lizenz
 
 MIT — siehe [LICENSE](LICENSE).
