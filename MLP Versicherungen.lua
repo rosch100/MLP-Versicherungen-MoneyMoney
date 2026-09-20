@@ -142,8 +142,9 @@ end
 -- JWE Compact Serialization (RSA-OAEP-512 + A256GCM)
 -- ============================================================================
 
+--- MoneyMoney ≥ 2.5.2: AES-GCM via MM.aes256encrypt(..., "aes256 gcm", aad).
 function canUseA256Gcm()
-  return type(MM.aes256gcm) == "function" or type(MM.aesgcm) == "function"
+  return type(MM.aes256encrypt) == "function"
 end
 
 --- True when MoneyMoney exposes the APIs needed to build MLP JWE locally.
@@ -156,27 +157,21 @@ function canUseJweLogin()
 end
 
 function aesGcmEncrypt(key, iv, plaintext, aad)
-  if type(MM.aes256gcm) == "function" then
-    local ok, ciphertext, tag = pcall(function()
-      if aad then
-        return MM.aes256gcm(key, iv, plaintext, aad)
-      end
-      return MM.aes256gcm(key, iv, plaintext)
-    end)
-    if ok and type(ciphertext) == "string" then
-      if type(tag) == "string" then
-        return ciphertext, tag
-      end
-      return ciphertext, nil
-    end
+  if type(MM.aes256encrypt) ~= "function" then
+    return nil, nil
   end
-  if type(MM.aesgcm) == "function" then
-    local ok, ciphertext, tag = pcall(function()
-      return MM.aesgcm(key, iv, plaintext, aad)
-    end)
-    if ok and type(ciphertext) == "string" then
+  -- GCM requires AAD (may be empty); see moneymoney-app.com/api/webbanking/
+  if aad == nil then
+    aad = ""
+  end
+  local ok, ciphertext, tag = pcall(function()
+    return MM.aes256encrypt(key, iv, plaintext, "aes256 gcm", aad)
+  end)
+  if ok and type(ciphertext) == "string" then
+    if type(tag) == "string" then
       return ciphertext, tag
     end
+    return ciphertext, nil
   end
   return nil, nil
 end
@@ -190,8 +185,8 @@ function generateJwe(payload, publicKey)
     return nil, "Kryptografische Funktionen nicht verfügbar. Cookie-Import erforderlich."
   end
   if not canUseA256Gcm() then
-    mlpDebugLog("MLP-DEBUG: MM.aes256gcm nicht verfügbar!")
-    return nil, "A256GCM nicht verfügbar (MM.aes256gcm fehlt). Cookie-Import erforderlich."
+    mlpDebugLog("MLP-DEBUG: MM.aes256encrypt nicht verfügbar!")
+    return nil, "A256GCM nicht verfügbar (MM.aes256encrypt fehlt). Cookie-Import erforderlich."
   end
 
   local cek = generateRandomBytes(32)

@@ -411,8 +411,7 @@ do
     return { success = false, error = "JOSE", needsCookie = true }
   end
   MM.random = nil
-  MM.aes256gcm = nil
-  MM.aesgcm = nil
+  MM.aes256encrypt = nil
   MM.rsaEncrypt = nil
   MM.base64urlencode = nil
   local result = performLogin("mlp-user", "secret")
@@ -441,6 +440,26 @@ do
   assertEq(seenPadding[1], "pkcs1-oaep sha512", "encryptCekWithRsa.padding")
 end
 
+-- AES-GCM über dokumentierte MM.aes256encrypt(..., "aes256 gcm", aad)-API (MM ≥ 2.5.2).
+do
+  local seen = {}
+  MM.aes256encrypt = function(key, iv, data, algorithm, aad)
+    seen.key = key
+    seen.iv = iv
+    seen.data = data
+    seen.algorithm = algorithm
+    seen.aad = aad
+    return "ct-bytes", "tag-bytes"
+  end
+  local ciphertext, tag = aesGcmEncrypt("k32", "iv12", "plain", "aad-header")
+  assertEq(ciphertext, "ct-bytes", "aesGcmEncrypt.ciphertext")
+  assertEq(tag, "tag-bytes", "aesGcmEncrypt.tag")
+  assertEq(seen.algorithm, "aes256 gcm", "aesGcmEncrypt.algorithm")
+  assertEq(seen.aad, "aad-header", "aesGcmEncrypt.aad")
+  local _, _ = aesGcmEncrypt("k32", "iv12", "plain", nil)
+  assertEq(seen.aad, "", "aesGcmEncrypt.nilAadBecomesEmpty")
+end
+
 -- Wenn JWE-APIs da sind, aber Generierung cryptoIncomplete → Klartext-Fallback.
 do
   local plaintextCalled = false
@@ -456,7 +475,7 @@ do
   MM.random = function(n) return string.rep("\0", n) end
   MM.base64urlencode = function(s) return "b64u" end
   MM.rsaEncrypt = function() return "x" end
-  MM.aes256gcm = function() return "ct", "tag" end
+  MM.aes256encrypt = function() return "ct", "tag" end
   assertEq(canUseJweLogin(), true, "canUseJweLogin.whenApisPresent")
   local result = performLogin("mlp-user", "secret")
   performPlaintextLogin = realPlaintext
