@@ -11,6 +11,9 @@ im Kundenportal.
 
 ## Installation
 
+Noch nicht auf [moneymoney.app/extensions](https://moneymoney.app/extensions/) —
+Veröffentlichung mit dem nächsten MoneyMoney-Update (Whitelist).
+
 Unsignierte Datei:
 [MLP Versicherungen.lua](https://raw.githubusercontent.com/rosch100/MLP-Versicherungen-MoneyMoney/main/MLP%20Versicherungen.lua)
 
