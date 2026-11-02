@@ -582,6 +582,31 @@ local missingValueOk, missingValueError = pcall(
 assertEq(missingValueOk, false, "RefreshAccount.requiresShareValue")
 assertContains(missingValueError, "Vertragswert", "RefreshAccount.shareValueMessage")
 
+-- Cookie-Import mit Netzwerkfehler bei der Prüfung: keine erneute Cookie-Anforderung.
+Connection = function()
+  return {
+    language = "",
+    useragent = "test",
+    get = function() return nil end,
+    request = function() return nil end,
+    setCookie = function() end,
+    getCookies = function() return "" end,
+  }
+end
+LocalStorage = {}
+local unreachableCookies = InitializeSession2(
+  ProtocolWebBanking,
+  "MLP Versicherungen",
+  1,
+  {"mlp-user", "COOKIE:VUSESSIONID=abc"},
+  true)
+assertEq(
+  type(unreachableCookies) == "string"
+    and unreachableCookies:find("nicht erreichbar", 1, true) ~= nil
+    and unreachableCookies:find("Cookie-Import erforderlich", 1, true) == nil,
+  true,
+  "cookieAuth.unreachableNoCookiePrompt")
+
 performLogin = function()
   return {
     success = false,

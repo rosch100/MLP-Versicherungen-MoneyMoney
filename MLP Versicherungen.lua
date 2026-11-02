@@ -581,6 +581,7 @@ end
 function tryPersistedAuth(storage)
   collectSessionCookies()
 
+  -- nil (keine Antwort) fällt wie false auf den Passwort-Login zurück; der fordert keine Cookies an.
   if isAuthenticated() then
     MM.printStatus("MLP: Bestehende Session gültig (persistierte Connection).")
     persistSessionCookies(storage)
@@ -702,7 +703,11 @@ function tryCookieAuth()
 
   MM.printStatus("MLP: Versuche Authentifizierung mit Cookies...")
 
-  if isAuthenticated() then
+  local valid = isAuthenticated()
+  if valid == nil then
+    return "MLP ist gerade nicht erreichbar. Bitte in einigen Minuten erneut versuchen."
+  end
+  if valid then
     local storage = rawget(_G, "LocalStorage")
     persistSessionCookies(storage)
     if loadContracts() then
@@ -1380,9 +1385,15 @@ function tryContractListAuth(cookieHeader)
     end
   end
 
-  return false
+  -- Server hat geantwortet, aber ohne Vertragsliste: Sitzung ungültig.
+  -- Keine Antwort (Fehler der Anfrage): Zustand unbekannt, nil.
+  if success and type(contentOrError) == "string" then
+    return false
+  end
+  return nil
 end
 
+-- true: Sitzung gültig. false: Server meldet Sitzung als ungültig. nil: keine Antwort.
 function isAuthenticated()
   local hasVuSession = session.sessionCookies.VUSESSIONID and session.sessionCookies.VUSESSIONID ~= ""
 
