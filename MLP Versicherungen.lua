@@ -562,7 +562,7 @@ function performLogin(username, password, interactive)
     return jweResult
   end
 
-  -- Username/Passwort bleibt auch ohne JWE-APIs: Klartext versuchen, sonst Cookie.
+  -- Username/Passwort auch ohne JWE-APIs: Klartext-Login.
   MM.printStatus("MLP: JWE-Krypto-APIs nicht verfügbar — Klartext-Login...")
   return performPlaintextLogin(username, password, interactive)
 end

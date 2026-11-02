@@ -6,7 +6,7 @@ Version: **1.0**
 Repository: https://github.com/rosch100/MLP-Versicherungen-MoneyMoney
 Gemeinsame Infos: https://github.com/rosch100/moneymoney-extensions
 
-Das ist nicht das FinTS-Giro der MLP Bank, sondern nur die Versicherungsverträge
+Das ist nicht das FinTS-Giro der MLP Bank, sondern nur die Versicherungen
 im Kundenportal.
 
 ## Installation
@@ -21,19 +21,31 @@ Datei nach
 `~/Library/Containers/com.moneymoney-app.retail/Data/Library/Application Support/MoneyMoney/Extensions`
 kopieren, oder im Klon `./link_ext.sh` ausführen.
 
-Unsignierte Plugins: MoneyMoney-**Beta**, Signaturprüfung unter
-*MoneyMoney → Einstellungen → Erweiterungen* ausschalten.
+Unsignierte Erweiterungen laufen nur, wenn die Signaturprüfung unter
+*MoneyMoney → Einstellungen → Erweiterungen* ausgeschaltet ist.
 
 ## Einrichten
 
 *Konto hinzufügen* → *Andere* → **MLP Versicherungen**.
 
-Anmeldung mit Benutzername und Passwort. Die SecureGo-Freigabe bestätigen Sie
-in der SecureGo-App; die Erweiterung wartet darauf.
+Anmelden mit Benutzername und Passwort des MLP-Kundenportals. Danach bestätigen
+Sie den Login in der **SecureGo-Plus-App**. MoneyMoney wartet dort bis zu zwei
+Minuten auf Ihre Freigabe. Danach lädt die Erweiterung die Verträge.
+
+Cookie-Import (`COOKIE:…`) gibt es in Version 1.0 nicht.
 
 ## Nutzung
 
 Nach dem Einrichten den Zugang aktualisieren.
+
+- Jeder Versicherungsvertrag mit Anteilswert erscheint als eigenes Konto. Der
+  Kontoname enthält Versicherer, Vertragsnummer, Tarif und, falls vorhanden, das
+  Datum „Beitrag bis“. Verträge ohne Anteilswert werden nicht angelegt.
+- Solange die gespeicherte Sitzung gilt, ist keine neue SecureGo-Freigabe nötig.
+- Ein Abruf ohne Ihre Eingabe, etwa eine Hintergrund-Aktualisierung, startet
+  keine Freigabe. Ist die Sitzung abgelaufen, bricht der Abruf mit der Meldung
+  ab, den Login in MoneyMoney manuell zu starten. Dann den Zugang aktualisieren
+  und die Freigabe in der App bestätigen.
 
 ## Fehler & Ideen
 
