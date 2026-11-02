@@ -116,12 +116,18 @@ function base64UrlEncode(data)
   return ""
 end
 
+-- Base64URL (RFC 4648 §5) in Standard-Base64 mit Padding umwandeln und mit dem offiziellen
+-- MM.base64decode dekodieren. MM.base64urldecode existiert in MoneyMoney nicht.
 function base64UrlDecode(encoded)
   if not encoded or encoded == "" then return "" end
-  if type(MM.base64urldecode) == "function" then
-    return MM.base64urldecode(encoded)
+  if type(MM.base64decode) ~= "function" then
+    error("MLP Versicherungen: MM.base64decode fehlt, JWKS-Schlüssel können nicht gelesen werden.")
   end
-  return ""
+  local standard = (encoded:gsub("-", "+"))
+  standard = (standard:gsub("_", "/"))
+  local padding = (4 - #standard % 4) % 4
+  standard = standard .. string.rep("=", padding)
+  return MM.base64decode(standard)
 end
 
 function generateRandomBytes(length)

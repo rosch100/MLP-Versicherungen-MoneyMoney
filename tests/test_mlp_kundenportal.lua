@@ -719,5 +719,21 @@ do
     "multiLogin.cookies.userA.afterRestore")
 end
 
+-- base64UrlDecode: nutzt das offizielle MM.base64decode (Base64URL -> Base64 mit Padding).
+do
+  local seen = nil
+  MM.base64urldecode = nil
+  MM.base64decode = function(s) seen = s; return "decoded" end
+  assertEq(base64UrlDecode("ab-_"), "decoded", "base64UrlDecode.returnsDecoded")
+  assertEq(seen, "ab+/", "base64UrlDecode.alphabet")
+  base64UrlDecode("ab-")
+  assertEq(seen, "ab+=", "base64UrlDecode.padding")
+  local rsaKey = extractPublicKeyFromJwk({kty = "RSA", n = "ab-_", e = "AQAB", kid = "k"})
+  assertEq(rsaKey and rsaKey.n, "decoded", "extractPublicKeyFromJwk.rsaKeyKept")
+  MM.base64decode = nil
+  local ok = pcall(base64UrlDecode, "ab")
+  assertEq(ok, false, "base64UrlDecode.missingApiFails")
+end
+
 print()
 print("ALL TESTS PASSED")
