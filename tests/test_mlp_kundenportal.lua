@@ -260,6 +260,22 @@ Connection = function()
     getCookies = function() return "" end,
   }
 end
+
+-- Frische Verbindung für einen Test: gespeicherte Verbindung des Kontos entfernen, Session-Cookies leeren.
+local function startFreshConnection(accountKey)
+  local storage = rawget(_G, "LocalStorage")
+  if storage then
+    storage.connectionsByAccount = storage.connectionsByAccount or {}
+    storage.connectionsByAccount[accountKey] = nil
+    if storage.connectionAccountKey == accountKey then
+      storage.connection = nil
+      storage.connectionAccountKey = nil
+    end
+  end
+  restorePersistedSessionCookies(nil, false)
+  restoreConnection(accountKey)
+end
+
 startFreshConnection("cookie-parsing")
 collectSessionCookiesFromText("VUSESSIONID=first;BIGipServervue.mlp.de=lb1;VUSESSIONID=second")
 local cookieHeader = buildCookieHeader(true)
@@ -1024,6 +1040,33 @@ do
   assertEq(calls[3].path:find("liefereTanVerfahren", 1, true) ~= nil, true, "browserTan.start.order.delivery")
   assertEq(calls[4].method, "POST", "browserTan.start.order.approval.post")
   assertContains(calls[4].body, "tp-123", "browserTan.start.approval.usesProcessId")
+
+  -- Einzelne fehlgeschlagene Statusabfragen beenden das Warten nicht, erst mehrere Fehler in Folge.
+  do
+    local originalCallAuthProcess = callAuthProcess
+    local scripted = {}
+    callAuthProcess = function()
+      local step = table.remove(scripted, 1)
+      if step.status then
+        return step.status
+      end
+      return nil, step.err
+    end
+    scripted = {
+      { err = "Netzwerkfehler" },
+      { status = { status = "DIREKTFREIGABE_OFFEN" } },
+      { status = { status = "DIREKTFREIGABE_BESTAETIGT" } },
+    }
+    assertEq(waitForSecureGoApproval("tp-poll", 10), nil, "secureGo.wait.toleratesSingleError")
+    scripted = {
+      { err = "e1" },
+      { err = "e2" },
+      { err = "e3" },
+      { status = { status = "DIREKTFREIGABE_BESTAETIGT" } },
+    }
+    assertEq(waitForSecureGoApproval("tp-poll", 10), "e3", "secureGo.wait.stopsAfterConsecutiveErrors")
+    callAuthProcess = originalCallAuthProcess
+  end
 
   -- Bleibt die Freigabe offen, endet das Warten mit einer Fehlermeldung (ohne Dialog).
   local pending = completeBrowserDetectionTan()

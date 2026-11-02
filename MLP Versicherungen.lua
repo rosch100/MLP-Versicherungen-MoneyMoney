@@ -16,7 +16,6 @@ WebBanking{
 local CONSTANTS = {
   baseUrl           = "https://kundenportal.mlp.de",
   authBaseUrl       = "https://financepilot-pe.mlp.de",
-  loginPageUrl      = "https://kundenportal.mlp.de/login",
   userAgent         = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15",
   loginEndpoint     = "/services_auth/auth-backend/api/authentication/login",
   portalOkpLogin    = "/api/okp/login?backUrl=https://kundenportal.mlp.de/kunde",
@@ -33,11 +32,11 @@ local CONSTANTS = {
   vueApiBase        = "https://vue.mlp.de",
   vueTokenEndpoint  = "/vu/api/token",
   vueContractListPath = "/vu/api/contract/list",
-  vueClientPath     = "/vu/client/index.html",
   portalVuApi       = "/api/app/vu",
   mfaSessionExpired = "MFA-Session abgelaufen. Bitte neu einloggen.",
   secureGoPollAttempts = 40,
   secureGoPollSeconds = 3,
+  secureGoMaxConsecutiveErrors = 3,
   allowedHosts = {
     "kundenportal.mlp.de",
     "financepilot-pe.mlp.de",
@@ -349,9 +348,6 @@ function extractPublicKeyFromJwk(jwk)
       return nil
     end
 
-    session.jwkModulus = n
-    session.jwkExponent = e
-    session.jwkKid = jwk.kid or "default"
     return constructPublicKeyFromComponents(n, e)
   end
 
@@ -429,21 +425,6 @@ function restoreConnection(accountKey)
   return canReuse, storage
 end
 
--- Ersetzt die gespeicherte Verbindung durch eine frische (leerer Cookie-Jar, kein Session-Cookie).
-function startFreshConnection(accountKey)
-  connection = Connection()
-  connection.language = "de-DE"
-  connection.useragent = CONSTANTS.userAgent
-  session.sessionCookies = {}
-  local storage = rawget(_G, "LocalStorage")
-  if storage then
-    storage.connectionsByAccount = storage.connectionsByAccount or {}
-    storage.connectionsByAccount[accountKey] = { connection = connection }
-    storage.connection = connection
-    storage.connectionAccountKey = accountKey
-  end
-end
-
 function restorePersistedSessionCookies(storage, canReuse)
   session.sessionCookies = {}
   if not canReuse or not storage then
@@ -517,7 +498,6 @@ function loginStep1(credentials, interactive)
   local accountKey = username or ""
   local canReuse, storage = restoreConnection(accountKey)
 
-  session.username = username
   restorePersistedSessionCookies(storage, canReuse)
 
   MM.printStatus("MLP: Initialisiere Session...")
@@ -602,9 +582,6 @@ function parseLoginResponse(content)
   end
 
   if response.access_token then
-    session.accessToken = response.access_token
-    session.refreshToken = response.refresh_token
-    session.tokenExpires = response.expires_in and (os.time() + response.expires_in) or nil
     return { success = true }
   end
 
@@ -1100,16 +1077,23 @@ end
 -- Die Abfrage nutzt die tanProzessId, wie der Browser (siehe HAR).
 function waitForSecureGoApproval(tanProcessId, maxAttempts)
   MM.printStatus("MLP: Warte auf die Freigabe in der SecureGo-Plus-App...")
+  local consecutiveErrors = 0
   for attempt = 1, maxAttempts do
     local status, err = callAuthProcess("GET", CONSTANTS.directApprovalPath .. "/" .. tanProcessId, nil)
     if not status then
-      return err
-    end
-    if status.status == "DIREKTFREIGABE_BESTAETIGT" then
-      return nil
-    end
-    if status.status ~= "DIREKTFREIGABE_OFFEN" then
-      return "SecureGo-Freigabe nicht bestätigt (Status: " .. tostring(status.status) .. ")."
+      -- Ein kurzer Netzwerkfehler darf die Freigabe nicht abbrechen; erst mehrere Fehler in Folge.
+      consecutiveErrors = consecutiveErrors + 1
+      if consecutiveErrors >= CONSTANTS.secureGoMaxConsecutiveErrors then
+        return err
+      end
+    else
+      consecutiveErrors = 0
+      if status.status == "DIREKTFREIGABE_BESTAETIGT" then
+        return nil
+      end
+      if status.status ~= "DIREKTFREIGABE_OFFEN" then
+        return "SecureGo-Freigabe nicht bestätigt (Status: " .. tostring(status.status) .. ")."
+      end
     end
     if attempt < maxAttempts then
       MM.sleep(CONSTANTS.secureGoPollSeconds)
