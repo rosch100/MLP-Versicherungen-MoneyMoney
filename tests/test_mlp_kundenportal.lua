@@ -1,4 +1,4 @@
--- Tests für MLP Versicherungen Extension v0.91
+-- Tests für MLP Versicherungen Extension v1.0
 -- Testet Hilfsfunktionen, Login-State-Machine und Datenstrukturen
 
 -- WebBanking/Connection/MM stubben
@@ -8,28 +8,66 @@ ProtocolWebBanking = "WebBanking"
 AccountTypePortfolio = 5
 LoginFailed = "LoginFailed"
 
--- Minimaler JSON-Stub für parseLoginResponse-Tests
+-- JSON-Stub für die Tests: kleiner rekursiver Decoder (Objekte, Arrays, Strings, Zahlen, true/false/null).
+local function decodeJsonValue(text, pos)
+  pos = text:find("%S", pos) or error("JSON: unerwartetes Ende")
+  local c = text:sub(pos, pos)
+  if c == "{" then
+    local obj = {}
+    pos = text:find("%S", pos + 1)
+    if text:sub(pos, pos) == "}" then return obj, pos + 1 end
+    while true do
+      local key
+      key, pos = decodeJsonValue(text, pos)
+      pos = text:find(":", pos, true) + 1
+      obj[key], pos = decodeJsonValue(text, pos)
+      pos = text:find("%S", pos)
+      local sep = text:sub(pos, pos)
+      pos = pos + 1
+      if sep == "}" then return obj, pos end
+      if sep ~= "," then error("JSON: ',' oder '}' erwartet") end
+    end
+  elseif c == "[" then
+    local arr = {}
+    pos = text:find("%S", pos + 1)
+    if text:sub(pos, pos) == "]" then return arr, pos + 1 end
+    while true do
+      arr[#arr + 1], pos = decodeJsonValue(text, pos)
+      pos = text:find("%S", pos)
+      local sep = text:sub(pos, pos)
+      pos = pos + 1
+      if sep == "]" then return arr, pos end
+      if sep ~= "," then error("JSON: ',' oder ']' erwartet") end
+    end
+  elseif c == '"' then
+    local close = text:find('"', pos + 1, true) or error("JSON: String ohne Ende")
+    return text:sub(pos + 1, close - 1), close + 1
+  end
+  local literal, endPos = text:match("^([%w%.%-%+]+)()", pos)
+  if literal == "true" then return true, endPos end
+  if literal == "false" then return false, endPos end
+  if literal == "null" then return nil, endPos end
+  return tonumber(literal), endPos
+end
+
 JSON = function(jsonStr)
   return {
     dictionary = function()
-      local result = {}
-      for key, value in jsonStr:gmatch('"([^"]+)"%s*:%s*"([^"]*)"') do
-        result[key] = value
-      end
-      for key, value in jsonStr:gmatch('"([^"]+)"%s*:%s*(%d+)') do
-        result[key] = tonumber(value)
-      end
-      for key, value in jsonStr:gmatch('"([^"]+)"%s*:%s*(true|false)') do
-        result[key] = (value == "true")
-      end
-      return result
+      local value = decodeJsonValue(jsonStr, 1)
+      return type(value) == "table" and value or nil
     end,
-    array = function() return {} end
+    array = function()
+      local value = decodeJsonValue(jsonStr, 1)
+      return type(value) == "table" and value or nil
+    end
   }
 end
 
+local sleepCalls = 0
+
 MM = {
   printStatus = function(msg) io.stderr:write("[STATUS] " .. msg .. "\n") end,
+  sleep = function() sleepCalls = sleepCalls + 1 end,
   urlencode = function(s)
     return (tostring(s):gsub("([^%w%-%.%_%~])", function(c)
       return string.format("%%%02X", string.byte(c))
@@ -176,9 +214,14 @@ local emptyLogin = parseLoginResponse("")
 assertEq(emptyLogin.success, true, "parseLoginResponse.empty.success")
 assertEq(emptyLogin.emptyBody, true, "parseLoginResponse.empty.body")
 
-local mfaLogin = parseLoginResponse('{"challengeToken":"abc123","mfaRequired":true}')
-assertEq(mfaLogin.requiresMfa, true, "parseLoginResponse.mfa.required")
-assertEq(mfaLogin.mfaToken, "abc123", "parseLoginResponse.mfa.token")
+-- Browser-Erkennung: Login-Antwort aus der HAR verlangt die SecureGo-Freigabe.
+assertEq(
+  requiresBrowserDetectionTan('{"authenticationProcessResponse":{"authenticationProcessCompleted":false,'
+    .. '"nextAuthenticationProcessStep":{"actions":[{"stepType":"START_TAN_PROCESS_FOR_BROWSER_DETECTION_AUTH",'
+    .. '"urlOfResource":"x"}]}}}'),
+  true,
+  "browserTan.required")
+assertEq(requiresBrowserDetectionTan('{"access_token":"tok","expires_in":3600}'), false, "browserTan.notRequired")
 
 local tokenLogin = parseLoginResponse('{"access_token":"tok","expires_in":3600}')
 assertEq(tokenLogin.success, true, "parseLoginResponse.token.success")
@@ -192,6 +235,13 @@ local iframeJson = '{"iframeUrl":"https://vue.mlp.de/vu/client/index.html?source
 local iframeUrl = extractIframeUrlFromPortalResponse(iframeJson)
 assertContains(iframeUrl, "vue.mlp.de", "extractIframeUrl.host")
 assertContains(iframeUrl, "token=eyJtest", "extractIframeUrl.token")
+-- api/app/vu liefert XML (wie im Log), nicht JSON. Der Query-Parameter ist XML-escaped (&amp;).
+local iframeXml = '<IframePageDto><appUrl>https://vue.mlp.de/vu/client/</appUrl>'
+  .. '<iframeUrl>https://vue.mlp.de/vu/client/index.html?source=https://kundenportal.mlp.de&amp;token=eyJtest</iframeUrl>'
+  .. '</IframePageDto>'
+assertEq(extractIframeUrlFromPortalResponse(iframeXml),
+  "https://vue.mlp.de/vu/client/index.html?source=https://kundenportal.mlp.de&token=eyJtest",
+  "extractIframeUrl.xml")
 
 -- ============================================================
 -- Tests: Cookie-Parsing
@@ -200,13 +250,24 @@ assertContains(iframeUrl, "token=eyJtest", "extractIframeUrl.token")
 print()
 print("=== Test: Cookie-Parsing ===")
 
-parseCookieString("VUSESSIONID=first;BIGipServervue.mlp.de=lb1;VUSESSIONID=second")
+Connection = function()
+  return {
+    language = "",
+    useragent = "test",
+    get = function() return nil end,
+    request = function() return nil end,
+    setCookie = function() end,
+    getCookies = function() return "" end,
+  }
+end
+startFreshConnection("cookie-parsing")
+collectSessionCookiesFromText("VUSESSIONID=first;BIGipServervue.mlp.de=lb1;VUSESSIONID=second")
 local cookieHeader = buildCookieHeader(true)
 assertContains(cookieHeader, "VUSESSIONID=first", "parseCookie.vu1")
 assertContains(cookieHeader, "VUSESSIONID=second", "parseCookie.vu2")
 assertContains(cookieHeader, "BIGipServervue.mlp.de=lb1", "parseCookie.bigip")
 
-parseCookieString("VUSESSIONID=jar1; VUSESSIONID=jar2; BIGipServervue.mlp.de=jarlb")
+startFreshConnection("cookie-jar")
 collectSessionCookiesFromText("VUSESSIONID=jar1; VUSESSIONID=jar2; BIGipServervue.mlp.de=jarlb")
 local jarHeader = buildCookieHeader(true)
 assertContains(jarHeader, "VUSESSIONID=jar1", "collectCookies.vu1")
@@ -408,7 +469,7 @@ do
     plaintextCalled = true
     assertEq(username, "mlp-user", "performLogin.plaintextFallback.username")
     assertEq(password, "secret", "performLogin.plaintextFallback.password")
-    return { success = false, error = "JOSE", needsCookie = true }
+    return { success = false, error = "Klartext-Ergebnis" }
   end
   MM.random = nil
   MM.aes256encrypt = nil
@@ -418,7 +479,7 @@ do
   performPlaintextLogin = realPlaintext
   assertEq(plaintextCalled, true, "performLogin.plaintextFallback.called")
   assertEq(type(result), "table", "performLogin.plaintextFallback.result")
-  assertEq(result.needsCookie, true, "performLogin.plaintextFallback.needsCookie")
+  assertEq(result.error, "Klartext-Ergebnis", "performLogin.plaintextFallback.error")
 end
 
 -- JWE CEK: nur OAEP-SHA-512 (Header alg RSA-OAEP-512), kein SHA-256-Fallback.
@@ -470,7 +531,7 @@ do
   end
   performPlaintextLogin = function()
     plaintextCalled = true
-    return { success = false, error = "JOSE", needsCookie = true }
+    return { success = false, error = "Klartext-Ergebnis" }
   end
   MM.random = function(n) return string.rep("\0", n) end
   MM.base64urlencode = function(s) return "b64u" end
@@ -481,7 +542,7 @@ do
   performPlaintextLogin = realPlaintext
   performJweLogin = realJwe
   assertEq(plaintextCalled, true, "performLogin.cryptoIncomplete.fallsBackToPlaintext")
-  assertEq(result.needsCookie, true, "performLogin.cryptoIncomplete.plaintextResult")
+  assertEq(result.error, "Klartext-Ergebnis", "performLogin.cryptoIncomplete.plaintextResult")
 end
 
 local missingMfaState = InitializeSession2(
@@ -494,49 +555,178 @@ assertEq(type(missingMfaState), "string", "InitializeSession2.missingMfaState.ty
 assertEq(missingMfaState, "MFA-Session abgelaufen. Bitte neu einloggen.",
   "InitializeSession2.missingMfaState.message")
 
+-- Schritt 1 wartet auf die SecureGo-Freigabe und schließt den Login ab (kein Dialog, kein zweiter Schritt).
+local firstCalls = {}
 local firstConnection = {
   language = "",
   useragent = "test",
   get = function() return nil end,
   getCookies = function() return "" end,
-  request = function()
-    return '{"pending":true}'
+  request = function(self, method, url)
+    table.insert(firstCalls, url)
+    if url:find("tan-methods-check", 1, true) then
+      return '{"hasTanMethods":true}'
+    end
+    if url:find("browser-detection-auth/start", 1, true) then
+      return '{"authenticationProcessResponse":{"authenticationProcessCompleted":false,'
+        .. '"resultOfCurrentAuthenticationProcessStep":{"tanProzessId":"tp-1"}}}'
+    end
+    if url:find("liefereTanVerfahren", 1, true) then
+      return '{"tanVerfahren":[{"typ":"SECUREGO_PLUS"}]}'
+    end
+    if url:find("direktfreigabe/authentication/tp-1", 1, true) then
+      return '{"status":"DIREKTFREIGABE_BESTAETIGT"}'
+    end
+    if url:find("direktfreigabe/authentication", 1, true) then
+      return '{"status":"DIREKTFREIGABE_OFFEN","transaktionsIdDirektfreigabe":"tx-1"}'
+    end
+    return '{"authenticationProcessResponse":{"authenticationProcessCompleted":true}}'
   end,
 }
-local restoredMfaCalls = 0
-local restoredConnection = {
-  language = "",
-  useragent = "test",
-  get = function() return nil end,
-  getCookies = function() return "" end,
-  request = function()
-    restoredMfaCalls = restoredMfaCalls + 1
-    return '{"pending":true}'
-  end,
-}
+local originalPerformLogin = performLogin
+local originalCompletePostLoginFlow = completePostLoginFlow
+local originalLoadContracts = loadContracts
 Connection = function()
   return firstConnection
 end
 LocalStorage = {}
-performLogin = function()
-  return {success = false, requiresMfa = true, mfaToken = "mfa-token"}
+performLogin = function(username, password, interactive)
+  return browserDetectionLoginResult(
+    '{"authenticationProcessResponse":{"nextAuthenticationProcessStep":{"actions":'
+      .. '[{"stepType":"START_TAN_PROCESS_FOR_BROWSER_DETECTION_AUTH"}]}}}',
+    interactive)
 end
-local mfaChallenge = InitializeSession2(
+completePostLoginFlow = function() return true end
+loadContracts = function() return true end
+local step1 = InitializeSession2(
   ProtocolWebBanking,
   "MLP Versicherungen",
   1,
   {"mlp-user", "password"},
   true)
-assertEq(type(mfaChallenge), "table", "InitializeSession2.mfaChallenge")
-LocalStorage.connection = restoredConnection
-LocalStorage.connectionAccountKey = "mlp-user"
-InitializeSession2(
+assertEq(step1, nil, "InitializeSession2.step1.completesAfterApproval")
+assertEq(firstCalls[#firstCalls - 1]:find("browser-detection-auth/termination", 1, true) ~= nil, true,
+  "InitializeSession2.step1.terminates")
+assertEq(firstCalls[#firstCalls]:find("browser-detection/choose", 1, true) ~= nil, true,
+  "InitializeSession2.step1.trustsBrowser")
+
+-- Hintergrund-Refresh (interactive=false): keine SecureGo-Freigabe auslösen, sondern einen manuellen Login verlangen.
+firstCalls = {}
+local backgroundResult = InitializeSession2(
   ProtocolWebBanking,
   "MLP Versicherungen",
-  2,
-  {"123456"},
-  true)
-assertEq(restoredMfaCalls, 1, "InitializeSession2.restoresConnectionForStep2")
+  1,
+  {"mlp-user", "password"},
+  false)
+assertEq(type(backgroundResult), "string", "InitializeSession2.background.requiresManualLogin")
+local startedApproval = false
+for _, url in ipairs(firstCalls) do
+  if url:find("browser-detection-auth/start", 1, true) or url:find("direktfreigabe", 1, true) then
+    startedApproval = true
+  end
+end
+assertEq(startedApproval, false, "InitializeSession2.background.noApprovalStarted")
+
+-- Echter Login-Pfad ohne Stub: Mit interactive=true muss die Browser-TAN ausgelöst werden.
+local chainCalls = {}
+local chainConnection = {
+  language = "",
+  useragent = "test",
+  get = function(self, url)
+    table.insert(chainCalls, url)
+    if url:find("okp/login", 1, true) then
+      return ""
+    end
+    return nil
+  end,
+  getCookies = function() return "" end,
+  setCookie = function() end,
+  request = function(self, method, url)
+    table.insert(chainCalls, url)
+    if url:find("/api/authentication/login", 1, true) then
+      return '{"authenticationProcessResponse":{"nextAuthenticationProcessStep":{"actions":'
+        .. '[{"stepType":"START_TAN_PROCESS_FOR_BROWSER_DETECTION_AUTH"}]}}}'
+    end
+    if url:find("tan-methods-check", 1, true) then
+      return '{"hasTanMethods":true}'
+    end
+    if url:find("browser-detection-auth/start", 1, true) then
+      return '{"authenticationProcessResponse":{"authenticationProcessCompleted":false,'
+        .. '"resultOfCurrentAuthenticationProcessStep":{"tanProzessId":"tp-2"}}}'
+    end
+    if url:find("liefereTanVerfahren", 1, true) then
+      return '{"tanVerfahren":[{"typ":"SECUREGO_PLUS"}]}'
+    end
+    if url:find("direktfreigabe/authentication", 1, true) then
+      return '{"status":"DIREKTFREIGABE_OFFEN","transaktionsIdDirektfreigabe":"tx-2"}'
+    end
+    return '{}'
+  end,
+}
+local previousConnection = Connection
+Connection = function()
+  return chainConnection
+end
+startFreshConnection("mlp-chain-interactive")
+local chainResult = performPlaintextLogin("mlp-user", "password", true)
+assertEq(chainResult.requiresBrowserTan, true, "performPlaintextLogin.interactive.requiresBrowserTan")
+local chainStarted = false
+for _, url in ipairs(chainCalls) do
+  if url:find("browser-detection-auth/start", 1, true) then
+    chainStarted = true
+  end
+end
+assertEq(chainStarted, true, "performPlaintextLogin.interactive.startsApproval")
+local chainPortalStarted = false
+for _, url in ipairs(chainCalls) do
+  if url:find("okp/login", 1, true) then
+    chainPortalStarted = true
+  end
+end
+assertEq(chainPortalStarted, true, "performPlaintextLogin.startsPortalLogin")
+
+-- Vertrauenswürdiger Browser: Der Login ist ohne TAN abgeschlossen, Consent und Vue-Session folgen.
+local completedAuthJson = '{"authenticationProcessResponse":{"authenticationProcessCompleted":true,'
+  .. '"resultOfCurrentAuthenticationProcessStep":null,"nextAuthenticationProcessStep":null}}'
+assertEq(parseLoginResponse(completedAuthJson).success, true, "parseLoginResponse.authCompleted")
+
+local trustedConnection = {
+  language = "",
+  useragent = "test",
+  get = function(self, url)
+    if url:find("okp/login", 1, true) then
+      return ""
+    end
+    return nil
+  end,
+  getCookies = function() return "" end,
+  setCookie = function() end,
+  request = function(self, method, url)
+    if url:find("/api/authentication/login", 1, true) then
+      return completedAuthJson
+    end
+    return nil
+  end,
+}
+Connection = function()
+  return trustedConnection
+end
+startFreshConnection("mlp-trusted-plaintext")
+local postLoginCalls = 0
+completePostLoginFlow = function()
+  postLoginCalls = postLoginCalls + 1
+  return true
+end
+local trustedResult = performPlaintextLogin("mlp-user", "password", true)
+completePostLoginFlow = originalCompletePostLoginFlow
+assertEq(type(trustedResult) == "table" and trustedResult.success, true, "performPlaintextLogin.trusted.success")
+assertEq(postLoginCalls, 1, "performPlaintextLogin.trusted.completesPostLogin")
+Connection = previousConnection
+performLogin = originalPerformLogin
+completePostLoginFlow = originalCompletePostLoginFlow
+loadContracts = originalLoadContracts
+assertEq(InitializeSession2(ProtocolWebBanking, "MLP Versicherungen", 2, {"123456"}, true),
+  "MFA-Session abgelaufen. Bitte neu einloggen.", "InitializeSession2.step2.unsupported")
 
 Connection = function()
   return {
@@ -582,45 +772,92 @@ local missingValueOk, missingValueError = pcall(
 assertEq(missingValueOk, false, "RefreshAccount.requiresShareValue")
 assertContains(missingValueError, "Vertragswert", "RefreshAccount.shareValueMessage")
 
--- Cookie-Import mit Netzwerkfehler bei der Prüfung: keine erneute Cookie-Anforderung.
-Connection = function()
-  return {
+-- Passwort-Login nach fehlgeschlagenem Session-Check nutzt die gespeicherte Verbindung weiter,
+-- damit das Geräte-Cookie (CAS_DEVICE_SESSION) erhalten bleibt. Es wird keine neue Verbindung erzeugt.
+do
+  local originalPersistedAuth = tryPersistedAuth
+  local originalPerformLogin = performLogin
+  local created = 0
+  local function stubConnection(cookies)
+    return {
+      language = "",
+      useragent = "",
+      get = function() return nil end,
+      request = function() return nil end,
+      setCookie = function() end,
+      getCookies = function() return cookies end,
+    }
+  end
+  local storedConnection = stubConnection("CAS_S_SESSION=old; CAS_DEVICE_SESSION=old")
+  Connection = function()
+    created = created + 1
+    return stubConnection("")
+  end
+  LocalStorage = {
+    connection = storedConnection,
+    connectionAccountKey = "mlp-reuse",
+    connectionsByAccount = { ["mlp-reuse"] = { connection = storedConnection } },
+  }
+  tryPersistedAuth = function() return false end
+  performLogin = function() return { success = false, error = "403 Invalid credentials" } end
+  loginStep1({"mlp-reuse", "secret"})
+  assertEq(LocalStorage.connection, storedConnection, "passwordLogin.reusesConnection")
+  assertEq(created, 0, "passwordLogin.noNewConnection")
+  tryPersistedAuth = originalPersistedAuth
+  performLogin = originalPerformLogin
+end
+
+-- Veraltete VUSESSIONID aus dem Speicher darf den Passwort-Login nicht erreichen.
+do
+  local originalPersistedAuth = tryPersistedAuth
+  local originalPerformLogin = performLogin
+  local storedConnection = {
     language = "",
-    useragent = "test",
+    useragent = "",
     get = function() return nil end,
     request = function() return nil end,
     setCookie = function() end,
     getCookies = function() return "" end,
   }
+  Connection = function() return storedConnection end
+  LocalStorage = {
+    connection = storedConnection,
+    connectionAccountKey = "mlp-stale-vu",
+    connectionsByAccount = {
+      ["mlp-stale-vu"] = { connection = storedConnection, sessionCookies = { VUSESSIONID = "stale-vu" } },
+    },
+  }
+  local headerDuringLogin = nil
+  tryPersistedAuth = function() return false end
+  performLogin = function()
+    headerDuringLogin = buildCookieHeader(true)
+    return { success = false, error = "Login fehlgeschlagen" }
+  end
+  loginStep1({"mlp-stale-vu", "secret"})
+  assertEq(headerDuringLogin ~= nil and headerDuringLogin:find("stale-vu", 1, true) == nil, true,
+    "passwordLogin.staleVuSessionDropped")
+  tryPersistedAuth = originalPersistedAuth
+  performLogin = originalPerformLogin
+  LocalStorage = {}
 end
-LocalStorage = {}
-local unreachableCookies = InitializeSession2(
-  ProtocolWebBanking,
-  "MLP Versicherungen",
-  1,
-  {"mlp-user", "COOKIE:VUSESSIONID=abc"},
-  true)
-assertEq(
-  type(unreachableCookies) == "string"
-    and unreachableCookies:find("nicht erreichbar", 1, true) ~= nil
-    and unreachableCookies:find("Cookie-Import erforderlich", 1, true) == nil,
-  true,
-  "cookieAuth.unreachableNoCookiePrompt")
 
 performLogin = function()
   return {
     success = false,
     error = "403 Invalid credentials",
-    needsCookie = true,
   }
-end
-tryCookieAuth = function()
-  return "Cookie-Import erforderlich"
 end
 assertEq(
   loginStep1({"mlp-user", "wrong"}),
   LoginFailed,
-  "loginStep1.classifiesCredentialsBeforeCookieFallback")
+  "loginStep1.classifiesCredentialsRejected")
+
+-- Ohne Passwort gibt es keinen Cookie-Rückfall mehr, sondern eine klare Meldung.
+LocalStorage = {}
+assertEq(
+  loginStep1({"mlp-user", ""}),
+  "Bitte Benutzername und Passwort eingeben.",
+  "loginStep1.missingPassword.message")
 
 local incompleteVueContract = mapVueContractToInternal({
   number = "VUE-1",
@@ -733,6 +970,272 @@ do
   MM.base64decode = nil
   local ok = pcall(base64UrlDecode, "ab")
   assertEq(ok, false, "base64UrlDecode.missingApiFails")
+end
+
+-- Browser-Erkennung: TAN-Prüfung, SecureGo-Freigabe, dann "Trust this browser" (useBrowserDetection = true).
+do
+  local calls = {}
+  local directStatus = "DIREKTFREIGABE_OFFEN"
+  local hasTanMethods = true
+  local originalConnection = Connection
+  local originalComplete = completePostLoginFlow
+  local originalLoadContracts = loadContracts
+  Connection = function()
+    return {
+      get = function() return nil end,
+      request = function(self, method, url, body, contentType, headers)
+        local path = url:gsub("^https://financepilot%-pe%.mlp%.de", "")
+        table.insert(calls, {method = method, path = path, body = body, contentType = contentType})
+        if path:find("tan-methods-check", 1, true) then
+          return hasTanMethods and '{"hasTanMethods":true}' or '{"hasTanMethods":false}'
+        end
+        if path:find("browser-detection-auth/start", 1, true) then
+          return '{"authenticationProcessResponse":{"authenticationProcessCompleted":false,'
+            .. '"resultOfCurrentAuthenticationProcessStep":{"tanProzessId":"tp-123"}}}'
+        end
+        if path:find("liefereTanVerfahren", 1, true) then
+          return '{"tanVerfahren":[{"typ":"SECUREGO_PLUS"}]}'
+        end
+        if method == "GET" then
+          -- Der Browser fragt den Status mit der tanProzessId ab (wie in der HAR), nicht mit der Transaktions-ID.
+          if path:sub(-#"/tp-123") == "/tp-123" and path:find("direktfreigabe/authentication", 1, true) then
+            return '{"status":"' .. directStatus .. '"}'
+          end
+          return nil
+        end
+        if path:find("direktfreigabe/authentication", 1, true) then
+          return '{"status":"DIREKTFREIGABE_OFFEN","transaktionsIdDirektfreigabe":"tx-1"}'
+        end
+        if path:find("browser-detection-auth/termination", 1, true)
+            or path:find("browser-detection/choose", 1, true) then
+          return '{"authenticationProcessResponse":{"authenticationProcessCompleted":true}}'
+        end
+        return nil
+      end,
+      setCookie = function() end,
+      getCookies = function() return "" end,
+    }
+  end
+
+  startFreshConnection("mlp-browser-tan")
+  assertEq(startBrowserDetectionTan(), nil, "browserTan.start.ok")
+  assertEq(calls[1].path:find("tan-methods-check", 1, true) ~= nil, true, "browserTan.start.order.methods")
+  assertEq(calls[2].path:find("browser-detection-auth/start", 1, true) ~= nil, true, "browserTan.start.order.start")
+  assertEq(calls[3].path:find("liefereTanVerfahren", 1, true) ~= nil, true, "browserTan.start.order.delivery")
+  assertEq(calls[4].method, "POST", "browserTan.start.order.approval.post")
+  assertContains(calls[4].body, "tp-123", "browserTan.start.approval.usesProcessId")
+
+  -- Bleibt die Freigabe offen, endet das Warten mit einer Fehlermeldung (ohne Dialog).
+  local pending = completeBrowserDetectionTan()
+  assertContains(pending, "Wartezeit", "browserTan.complete.timeoutMessage")
+  assertEq(sleepCalls > 0, true, "browserTan.complete.waitsBetweenPolls")
+
+  directStatus = "DIREKTFREIGABE_BESTAETIGT"
+  assertEq(startBrowserDetectionTan(), nil, "browserTan.restart.ok")
+  completePostLoginFlow = function() return true end
+  loadContracts = function() return true end
+  assertEq(completeBrowserDetectionTan(), nil, "browserTan.complete.success")
+  local termination = calls[#calls - 1]
+  assertContains(termination.path, "browser-detection-auth/termination", "browserTan.termination.path")
+  assertEq(termination.body, "", "browserTan.termination.emptyBody")
+  assertEq(termination.contentType, nil, "browserTan.termination.noContentType")
+  local choose = calls[#calls]
+  assertEq(choose.path:find("browser-detection/choose", 1, true) ~= nil, true, "browserTan.complete.chooseLast")
+  assertEq(choose.body, '{"useBrowserDetection":true}', "browserTan.complete.trustThisBrowser")
+
+  -- Ohne TAN-Verfahren: expliziter Fehler, kein Trust-Schritt.
+  calls = {}
+  hasTanMethods = false
+  assertContains(startBrowserDetectionTan(), "kein TAN-Verfahren", "browserTan.noMethods.fails")
+  assertEq(#calls, 1, "browserTan.noMethods.stopsAfterCheck")
+
+  Connection = originalConnection
+  completePostLoginFlow = originalComplete
+  loadContracts = originalLoadContracts
+end
+
+-- PIN-Verschlüsselungsschlüssel: kommt aus init-ui (nach OAuth-authorize mit PKCE), nicht aus dem JWKS.
+do
+  local requested = {}
+  local initUiBody = '{"pinEncryptionNonce":"nonce1","pinEncryptionPublicKey":'
+    .. '{"kty":"RSA","e":"AQAB","use":"enc","kid":"cas-pin-encryption-prod-v2","n":"ab-_"}}'
+  local originalConnection = Connection
+  Connection = function()
+    return {
+      get = function(self, url)
+        table.insert(requested, {method = "GET", url = url})
+        return "ok"
+      end,
+      request = function(self, method, url, body, contentType, headers)
+        table.insert(requested, {method = method, url = url})
+        if url:find("api/init-ui", 1, true) then
+          return initUiBody
+        end
+        return nil
+      end,
+      setCookie = function() end,
+      getCookies = function() return "" end,
+    }
+  end
+  startFreshConnection("mlp-pin-key")
+  MM.random = function(n) return string.rep("\1", n) end
+  MM.sha256 = function() return string.rep("ab", 32) end
+  MM.hexToBin = function(h) return h end
+  MM.base64urlencode = function(s) return "b64" end
+  MM.base64decode = function(s) return "decoded" end
+  local key, pinNonce = fetchPinEncryptionKey()
+  assertEq(type(key) == "table" and key.n, "decoded", "pinEncryptionKey.usesInitUiKey")
+  assertEq(pinNonce, "nonce1", "pinEncryptionKey.nonceFromInitUi")
+  -- Der Login startet am Kundenportal (wie im Browser): dort entstehen PKCE und State für kp.mlp.de.
+  assertEq(requested[1] and requested[1].url,
+    "https://kundenportal.mlp.de/api/okp/login?backUrl=https://kundenportal.mlp.de/kunde",
+    "pinEncryptionKey.startsAtKundenportal")
+  assertEq(requested[2] and requested[2].method, "POST", "pinEncryptionKey.initUiPost")
+  assertContains(
+    requested[2] and requested[2].url or "",
+    "api/init-ui?client_id=mlp&redirect_uri=https%3A%2F%2Fkp.mlp.de%2Fokp%2Flogin",
+    "pinEncryptionKey.initUiQuery")
+
+  -- Ohne Schlüssel in init-ui: expliziter Fehler, kein Fallback auf das JWKS.
+  initUiBody = '{"pinEncryptionNonce":"nonce1"}'
+  local missing, _, missingReason = fetchPinEncryptionKey()
+  assertEq(missing, nil, "pinEncryptionKey.missingFails")
+  assertContains(missingReason or "", "PIN-Verschlüsselungsschlüssel", "pinEncryptionKey.missingReason")
+
+  -- Fehlt der Schlüssel, endet der JWE-Login mit Fehler.
+  local noKeyLogin = performJweLogin("user", "pw")
+  assertEq(noKeyLogin.success, false, "performJweLogin.noKey.fails")
+  assertContains(noKeyLogin.error or "", "PIN-Verschlüsselungsschlüssel", "performJweLogin.noKey.error")
+
+  -- Fehlt die Nonce, endet der Login mit Fehler (sie gehört in den verschlüsselten Klartext).
+  initUiBody = '{"pinEncryptionPublicKey":{"kty":"RSA","e":"AQAB","use":"enc",'
+    .. '"kid":"cas-pin-encryption-prod-v2","n":"ab-_"}}'
+  local noNonceLogin = performJweLogin("user", "pw")
+  assertContains(noNonceLogin.error or "", "pinEncryptionNonce", "performJweLogin.noNonce.error")
+
+  -- Klartext wie im Browser: netkey = Nutzername, pin = Passwort, nonce = pinEncryptionNonce aus init-ui.
+  initUiBody = '{"pinEncryptionNonce":"nonce1","pinEncryptionPublicKey":'
+    .. '{"kty":"RSA","e":"AQAB","use":"enc","kid":"cas-pin-encryption-prod-v2","n":"ab-_"}}'
+  local capturedPayload = nil
+  local originalGenerateJwe = generateJwe
+  generateJwe = function(payload)
+    capturedPayload = payload
+    return nil, "payload captured"
+  end
+  performJweLogin("user", "pw")
+  generateJwe = originalGenerateJwe
+  assertEq(capturedPayload ~= nil and capturedPayload.netkey, "user", "performJweLogin.payload.netkey")
+  assertEq(capturedPayload ~= nil and capturedPayload.pin, "pw", "performJweLogin.payload.pin")
+  assertEq(capturedPayload ~= nil and capturedPayload.nonce, "nonce1", "performJweLogin.payload.nonce")
+  assertEq(capturedPayload ~= nil and capturedPayload.grant_type, nil, "performJweLogin.payload.noGrantType")
+  Connection = originalConnection
+end
+
+-- Consent-Antwort: OAuth-Parameter für kp.mlp.de/okp/login.
+do
+  local consentWithCode = '{"postAuthenticationProcessResponse":{"resultOfCurrentPostAuthenticationProcessStep":'
+    .. '{"parameter":"code=abc&state=st&iss=iss1"}}}'
+  assertEq(consentAuthorizationParameters(consentWithCode), "code=abc&state=st&iss=iss1", "consent.parameters.parsed")
+  local params, paramsError = consentAuthorizationParameters('{"postAuthenticationProcessResponse":{}}')
+  assertEq(params, nil, "consent.parameters.missing.nil")
+  assertContains(paramsError, "Autorisierungscode", "consent.parameters.missing.error")
+end
+
+-- Kundenportal-Login übergibt den Consent-Code an kp.mlp.de (wie der Browser), nicht über api/okp/login.
+do
+  local getUrls = {}
+  local originalConnection = Connection
+  Connection = function()
+    return {
+      get = function(_, url)
+        table.insert(getUrls, url)
+        return ""
+      end,
+      request = function() return nil end,
+      setCookie = function() end,
+      getCookies = function() return "" end
+    }
+  end
+  startFreshConnection("mlp-kp-login")
+  assertEq(establishKundenportalSession("code=abc&state=st&iss=iss1"), true, "kundenportal.redirectWithCode.ok")
+  assertEq(getUrls[1], "https://kp.mlp.de/okp/login?code=abc&state=st&iss=iss1", "kundenportal.redirectWithCode.url")
+  assertEq(getUrls[2], "https://kundenportal.mlp.de/", "kundenportal.redirectWithCode.portalRoot")
+  Connection = originalConnection
+end
+
+-- Vue-Token: wie der Browser (HAR) mit Source und X-Authorization aus der Iframe-URL.
+do
+  local iframe = "https://vue.mlp.de/vu/client/index.html?source=https://kundenportal.mlp.de&token=tok-1"
+  assertEq(queryParamFromUrl(iframe, "token"), "tok-1", "queryParam.token")
+  assertEq(queryParamFromUrl(iframe, "source"), "https://kundenportal.mlp.de", "queryParam.source")
+  assertEq(queryParamFromUrl(iframe, "missing"), nil, "queryParam.missing")
+-- Prozentkodierte Werte (Fallback-Pfad) werden wie im Browser dekodiert.
+assertEq(queryParamFromUrl("https://vue.mlp.de/vu/client/index.html?source=https%3A%2F%2Fkundenportal.mlp.de&token=t",
+  "source"), "https://kundenportal.mlp.de", "queryParam.percentDecoded")
+
+  local tokenHeaders = nil
+  local originalConnection = Connection
+  Connection = function()
+    return {
+      get = function() return "" end,
+      request = function(self, method, url, body, contentType, headers)
+        if url:find("/vu/api/token", 1, true) then
+          tokenHeaders = headers
+          return '{"ok":true}'
+        end
+        return nil
+      end,
+      setCookie = function() end,
+      getCookies = function() return "" end
+    }
+  end
+  startFreshConnection("mlp-vue-token")
+  assertEq(establishVueSession(iframe), true, "vueToken.ok")
+  assertEq(tokenHeaders and tokenHeaders["X-Authorization"], "tok-1", "vueToken.xAuthorization")
+  assertEq(tokenHeaders and tokenHeaders["Source"], "https://kundenportal.mlp.de", "vueToken.source")
+
+  -- Ein 403 des Token-Endpunkts ist ein Fehler, kein Erfolg.
+  Connection = function()
+    return {
+      get = function() return "" end,
+      request = function(self, method, url)
+        if url:find("/vu/api/token", 1, true) then
+          return '{"timestamp":"t","status":403,"error":"Forbidden","path":"/vu/api/token"}'
+        end
+        return nil
+      end,
+      setCookie = function() end,
+      getCookies = function() return "" end
+    }
+  end
+  startFreshConnection("mlp-vue-token-403")
+  assertEq(establishVueSession(iframe), false, "vueToken.forbiddenFails")
+  Connection = originalConnection
+end
+
+-- Session-Prüfung und Laden der Vertragsliste teilen sich eine Anfrage.
+do
+  local contractRequests = 0
+  local originalConnection = Connection
+  Connection = function()
+    return {
+      get = function() return "" end,
+      request = function(self, method, url)
+        if url:find("contract/list", 1, true) then
+          contractRequests = contractRequests + 1
+          return '{"contractList":[{"id":"c-1","number":"N1","shareValue":"10","contribution":"5","posTypeList":[]}]}'
+        end
+        return nil
+      end,
+      setCookie = function() end,
+      getCookies = function() return "" end
+    }
+  end
+  startFreshConnection("mlp-contract-once")
+  assertEq(isAuthenticated(), true, "contractList.probeValid")
+  assertEq(loadContracts(), true, "contractList.loadsFromProbe")
+  assertEq(contractRequests, 1, "contractList.singleRequest")
+  Connection = originalConnection
 end
 
 print()

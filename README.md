@@ -2,7 +2,7 @@
 
 MLP-Versicherungsverträge (Kundenportal) in MoneyMoney.
 
-Version: **0.92** (Beta)
+Version: **1.0**
 Repository: https://github.com/rosch100/MLP-Versicherungen-MoneyMoney
 Gemeinsame Infos: https://github.com/rosch100/moneymoney-extensions
 
@@ -28,14 +28,12 @@ Unsignierte Plugins: MoneyMoney-**Beta**, Signaturprüfung unter
 
 *Konto hinzufügen* → *Andere* → **MLP Versicherungen**.
 
-Anmeldung mit Benutzername/Passwort oder per Cookie-Import (`COOKIE:…` im
-Passwortfeld). Cookie-Ablauf:
-[Hub — Cookie-Import](https://github.com/rosch100/moneymoney-extensions#cookie-import-beta-extensions).
+Anmeldung mit Benutzername und Passwort. Die SecureGo-Freigabe bestätigen Sie
+in der SecureGo-App; die Erweiterung wartet darauf.
 
 ## Nutzung
 
-Nach dem Einrichten den Zugang aktualisieren. Bei Cookie-Anmeldung Session bei
-Bedarf erneuern.
+Nach dem Einrichten den Zugang aktualisieren.
 
 ## Fehler & Ideen
 

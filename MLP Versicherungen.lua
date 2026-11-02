@@ -3,14 +3,14 @@
 -- https://kundenportal.mlp.de
 -- API: https://moneymoney.app/api/webbanking/
 --
--- Authentifizierung: Cookie-Import (VUSESSIONID) — Beta 0.91
--- Version: 0.91 (Beta)
+-- Authentifizierung: Benutzername/Passwort mit SecureGo Plus — Version 1.0
+-- Version: 1.0
 
 WebBanking{
-  version     = 0.92,
+  version     = 1.0,
   url         = "https://kundenportal.mlp.de",
   services    = {"MLP Versicherungen"},
-  description = "MLP Versicherungen — Beta (Cookie-Import)"
+  description = "MLP Versicherungen"
 }
 
 local CONSTANTS = {
@@ -18,17 +18,26 @@ local CONSTANTS = {
   authBaseUrl       = "https://financepilot-pe.mlp.de",
   loginPageUrl      = "https://kundenportal.mlp.de/login",
   userAgent         = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15",
-  oidcConfigPath    = "/services_auth/oauth2/.well-known/openid-configuration",
-  jwksFallbackPath  = "/services_auth/oauth2/jwks.json",
   loginEndpoint     = "/services_auth/auth-backend/api/authentication/login",
+  portalOkpLogin    = "/api/okp/login?backUrl=https://kundenportal.mlp.de/kunde",
+  initUiPath        = "/services_auth/auth-backend/api/init-ui",
+  tanMethodsCheckPath             = "/services_auth/auth-backend/api/tan-process/tan-methods-check",
+  browserDetectionStartPath       = "/services_auth/auth-backend/api/tan-process/browser-detection-auth/start",
+  browserDetectionTerminationPath = "/services_auth/auth-backend/api/tan-process/browser-detection-auth/termination",
+  browserDetectionChoosePath      = "/services_auth/auth-backend/api/browser-detection/choose",
+  tanDeliveryPath   = "/services_auth/auth-backend/api/forward/tan/rest/de.bankenit.identitaet.tan.komponente.v1.TanKomponenteApi/liefereTanVerfahren",
+  directApprovalPath = "/services_auth/auth-backend/api/forward/tan/rest/de.bankenit.identitaet.tan.komponente.v1.TanKomponenteApi/direktfreigabe/authentication",
+  authClientId      = "mlp",
+  authRedirectUri   = "https://kp.mlp.de/okp/login",
   consentEndpoint   = "/services_auth/auth-backend/api/consent/execution",
   vueApiBase        = "https://vue.mlp.de",
   vueTokenEndpoint  = "/vu/api/token",
   vueContractListPath = "/vu/api/contract/list",
   vueClientPath     = "/vu/client/index.html",
   portalVuApi       = "/api/app/vu",
-  portalOkpLogin    = "/api/okp/login?backUrl=https://kundenportal.mlp.de/kunde",
   mfaSessionExpired = "MFA-Session abgelaufen. Bitte neu einloggen.",
+  secureGoPollAttempts = 40,
+  secureGoPollSeconds = 3,
   allowedHosts = {
     "kundenportal.mlp.de",
     "financepilot-pe.mlp.de",
@@ -40,9 +49,8 @@ local CONSTANTS = {
 local connection
 local session = {
   contracts = {},
-  state = nil,
   username = nil,
-  mfaToken = nil,
+  browserTanProcessId = nil,
   sessionCookies = {},
   persistedConnection = false
 }
@@ -137,13 +145,6 @@ function generateRandomBytes(length)
   error("MLP Versicherungen: MM.random ist für kryptografisch sichere Zufallsdaten erforderlich.")
 end
 
-function sha256(data)
-  if type(MM.sha256) == "function" then
-    return MM.sha256(data)
-  end
-  return nil
-end
-
 -- ============================================================================
 -- JWE Compact Serialization (RSA-OAEP-512 + A256GCM)
 -- ============================================================================
@@ -188,11 +189,11 @@ function generateJwe(payload, publicKey)
           type(MM.base64urlencode) == "function" and
           type(MM.rsaEncrypt) == "function") then
     mlpDebugLog("MLP-DEBUG: Fehlende Krypto-Funktionen!")
-    return nil, "Kryptografische Funktionen nicht verfügbar. Cookie-Import erforderlich."
+    return nil, "Kryptografische Funktionen nicht verfügbar."
   end
   if not canUseA256Gcm() then
     mlpDebugLog("MLP-DEBUG: MM.aes256encrypt nicht verfügbar!")
-    return nil, "A256GCM nicht verfügbar (MM.aes256encrypt fehlt). Cookie-Import erforderlich."
+    return nil, "A256GCM nicht verfügbar (MM.aes256encrypt fehlt)."
   end
 
   local cek = generateRandomBytes(32)
@@ -268,162 +269,72 @@ end
 -- Public Key Fetching (OIDC JWKS)
 -- ============================================================================
 
-function jsonRequestHeaders()
+-- Holt den Schlüssel für die PIN-Verschlüsselung wie der Browser:
+-- 1. Start am Kundenportal (okp/login), der über OAuth-authorize zur Anmeldung führt,
+-- 2. POST init-ui ohne Body. Die Antwort enthält pinEncryptionPublicKey.
+-- Liefert den RSA-Schlüssel und setzt session.publicKeyKid auf dessen kid.
+-- Fehlt der Schlüssel, liefert die Funktion nil (kein Fallback auf das JWKS).
+-- Startet den Login am Kundenportal wie im Browser. Dort entstehen PKCE und State, mit denen
+-- kp.mlp.de den Autorisierungscode später einlöst. Liefert true oder nil plus Fehlermeldung.
+function startPortalAuthorization()
+  local portalStart = connection:get(CONSTANTS.baseUrl .. CONSTANTS.portalOkpLogin)
+  if not portalStart then
+    MM.printStatus("MLP: Kundenportal-Login (okp/login) hat keine Antwort geliefert.")
+    return nil, "MLP: Kundenportal-Login (okp/login) hat keine Antwort geliefert."
+  end
+  collectSessionCookies()
+  return true
+end
+
+function fetchPinEncryptionKey()
+  MM.printStatus("MLP: Lade PIN-Verschlüsselungsschlüssel...")
+
+  if not connection then
+    mlpDebugLog("MLP-DEBUG: connection ist nil!")
+    return nil, nil, "MLP: Keine Verbindung für den Schlüssel-Abruf."
+  end
+
+  local started, startError = startPortalAuthorization()
+  if not started then
+    return nil, nil, startError
+  end
+
   local headers = {
     ["Accept"] = "application/json",
-    ["User-Agent"] = CONSTANTS.userAgent,
-    ["Origin"] = "https://financepilot-pe.mlp.de",
-    ["Referer"] = "https://financepilot-pe.mlp.de/"
+    ["Origin"] = CONSTANTS.authBaseUrl,
+    ["Referer"] = CONSTANTS.authBaseUrl .. "/",
   }
-
   local cookieHeader = buildCookieHeader(false)
   if cookieHeader ~= "" then
     headers["Cookie"] = cookieHeader
   end
 
-  return headers
-end
-
-function isAuthErrorPayload(content)
-  if type(content) ~= "string" or content == "" then
-    return true
-  end
-  if content:find("RBAC:") then
-    return true
-  end
-  if content:find('"httpStatus"%s*:%s*"UNAUTHORIZED"') then
-    return true
-  end
-  if content:find('"httpStatusCode"%s*:%s*401') then
-    return true
-  end
-  if content:find('"httpStatusCode"%s*:%s*403') then
-    return true
-  end
-  return false
-end
-
-function fetchOidcJwksUri()
-  local headers = jsonRequestHeaders()
-  local configUrl = CONSTANTS.authBaseUrl .. CONSTANTS.oidcConfigPath
-  mlpDebugLog("MLP-DEBUG: Lade OIDC-Konfiguration: " .. configUrl)
-
-  local content = connection:request("GET", configUrl, nil, nil, headers)
-  if isAuthErrorPayload(content) then
-    mlpDebugLog("MLP-DEBUG: OIDC-Konfiguration nicht verfügbar")
-    return CONSTANTS.authBaseUrl .. CONSTANTS.jwksFallbackPath
+  local initUiUrl = CONSTANTS.authBaseUrl .. CONSTANTS.initUiPath
+    .. "?client_id=" .. CONSTANTS.authClientId
+    .. "&redirect_uri=" .. urlEncode(CONSTANTS.authRedirectUri)
+  local content = connection:request("POST", initUiUrl, "", nil, headers)
+  local initUi = parseJson(content)
+  local jwk = type(initUi) == "table" and initUi.pinEncryptionPublicKey or nil
+  if type(jwk) ~= "table" or jwk.kty ~= "RSA" or type(jwk.kid) ~= "string" or jwk.kid == "" then
+    MM.printStatus("MLP: init-ui enthält keinen PIN-Verschlüsselungsschlüssel.")
+    mlpDebugLog("MLP-DEBUG: init-ui ohne gültiges pinEncryptionPublicKey")
+    return nil, nil, "MLP: init-ui lieferte keinen PIN-Verschlüsselungsschlüssel."
   end
 
-  local parsed = parseJson(content)
-  if parsed and type(parsed.jwks_uri) == "string" and parsed.jwks_uri ~= "" then
-    local allowed, allowErr = assertAllowedMlpUrl(parsed.jwks_uri)
-    if allowed then
-      mlpDebugLog("MLP-DEBUG: jwks_uri aus OIDC (Allowlist OK)")
-      return allowed
-    end
-    mlpDebugLog("MLP-DEBUG: jwks_uri abgelehnt: " .. tostring(allowErr))
+  local publicKey = extractPublicKeyFromJwk(jwk)
+  if not publicKey then
+    MM.printStatus("MLP: PIN-Verschlüsselungsschlüssel ist ungültig.")
+    return nil, nil, "MLP: PIN-Verschlüsselungsschlüssel aus init-ui ist ungültig."
   end
 
-  return CONSTANTS.authBaseUrl .. CONSTANTS.jwksFallbackPath
-end
-
-function selectEncJwkFromJwks(jwks)
-  if not jwks or type(jwks.keys) ~= "table" then
-    return nil
+  local pinNonce = initUi.pinEncryptionNonce
+  if type(pinNonce) ~= "string" or pinNonce == "" then
+    return nil, nil, "MLP: init-ui lieferte keine pinEncryptionNonce."
   end
 
-  local rsaEncKey = nil
-  local anyEncKey = nil
-
-  for _, key in ipairs(jwks.keys) do
-    if type(key) == "table" and key.use == "enc" then
-      if key.kty == "RSA" and key.n and key.e then
-        return key
-      end
-      if key.kty == "RSA" and not rsaEncKey then
-        rsaEncKey = key
-      end
-      if not anyEncKey then
-        anyEncKey = key
-      end
-    end
-  end
-
-  return rsaEncKey or anyEncKey
-end
-
-function extractPublicKeyFromJwks(jwks)
-  local jwk = selectEncJwkFromJwks(jwks)
-  if not jwk then
-    return nil
-  end
-
-  session.publicKeyKid = jwk.kid or "default"
-  mlpDebugLog("MLP-DEBUG: enc-JWK gewählt, kid=" .. tostring(jwk.kid) .. ", kty=" .. tostring(jwk.kty))
-  return extractPublicKeyFromJwk(jwk)
-end
-
-function parseJwksContent(content)
-  if type(content) ~= "string" or content == "" then
-    return nil
-  end
-
-  if content:find("BEGIN PUBLIC KEY") then
-    return content
-  end
-
-  local parsed = parseJson(content)
-  if parsed and type(parsed) == "table" then
-    local pub = extractPublicKeyFromJwks(parsed)
-    if pub then
-      return pub
-    end
-    if parsed.n and parsed.e then
-      session.publicKeyKid = parsed.kid or "default"
-      return extractPublicKeyFromJwk(parsed)
-    end
-  end
-
-  if JSON then
-    local ok, dict = pcall(function() return JSON(content):dictionary() end)
-    if ok and type(dict) == "table" then
-      local pub = extractPublicKeyFromJwks(dict)
-      if pub then
-        return pub
-      end
-    end
-  end
-
-  return nil
-end
-
-function fetchPublicKey()
-  MM.printStatus("MLP: Lade öffentlichen Schlüssel für JWE...")
-
-  if not connection then
-    mlpDebugLog("MLP-DEBUG: connection ist nil!")
-    return nil
-  end
-
-  local jwksUri = fetchOidcJwksUri()
-  local headers = jsonRequestHeaders()
-
-  mlpDebugLog("MLP-DEBUG: Lade JWKS: " .. jwksUri)
-  local content = connection:request("GET", jwksUri, nil, nil, headers)
-
-  if isAuthErrorPayload(content) then
-    mlpDebugLog("MLP-DEBUG: JWKS-Antwort ist Fehler (Status/Payload)")
-    return nil
-  end
-
-  local publicKey = parseJwksContent(content)
-  if publicKey then
-    mlpDebugLog("MLP-DEBUG: Public Key erfolgreich aus JWKS extrahiert")
-    return publicKey
-  end
-
-  mlpDebugLog("MLP-DEBUG: Kein enc-RSA-Key im JWKS gefunden")
-  return nil
+  session.publicKeyKid = jwk.kid
+  mlpDebugLog("MLP-DEBUG: PIN-Schlüssel aus init-ui, kid=" .. jwk.kid)
+  return publicKey, pinNonce
 end
 
 function extractPublicKeyFromJwk(jwk)
@@ -470,15 +381,9 @@ function SupportsBank(protocol, bankCode)
 end
 
 function InitializeSession2(protocol, bankCode, step, credentials, interactive)
+  -- Die SecureGo-Freigabe wird in Schritt 1 abgewartet. Einen zweiten Schritt gibt es nicht mehr.
   if step == 1 then
     return loginStep1(credentials, interactive)
-  end
-
-  if session.state == "awaitingMfa" then
-    local canReuse, storage = restoreConnection(session.username or "")
-    restorePersistedSessionCookies(storage, canReuse)
-    applySessionCookiesToConnection()
-    return submitMfaCode(credentials[1])
   end
 
   return CONSTANTS.mfaSessionExpired
@@ -524,6 +429,21 @@ function restoreConnection(accountKey)
   return canReuse, storage
 end
 
+-- Ersetzt die gespeicherte Verbindung durch eine frische (leerer Cookie-Jar, kein Session-Cookie).
+function startFreshConnection(accountKey)
+  connection = Connection()
+  connection.language = "de-DE"
+  connection.useragent = CONSTANTS.userAgent
+  session.sessionCookies = {}
+  local storage = rawget(_G, "LocalStorage")
+  if storage then
+    storage.connectionsByAccount = storage.connectionsByAccount or {}
+    storage.connectionsByAccount[accountKey] = { connection = connection }
+    storage.connection = connection
+    storage.connectionAccountKey = accountKey
+  end
+end
+
 function restorePersistedSessionCookies(storage, canReuse)
   session.sessionCookies = {}
   if not canReuse or not storage then
@@ -564,26 +484,6 @@ function persistSessionCookies(storage)
   storage.sessionCookies = session.sessionCookies
 end
 
-function applySessionCookiesToConnection()
-  if not connection or type(connection.setCookie) ~= "function" then
-    return
-  end
-
-  for name, value in pairs(session.sessionCookies) do
-    if type(name) == "string" and type(value) == "string" and name ~= "" then
-      local wireName = name
-      if wireName == "VUSESSIONID2" then
-        wireName = "VUSESSIONID"
-      elseif wireName:find("^BIGipServervue") then
-        wireName = "BIGipServervue.mlp.de"
-      end
-      pcall(function()
-        connection:setCookie(wireName .. "=" .. value)
-      end)
-    end
-  end
-end
-
 function tryPersistedAuth(storage)
   collectSessionCookies()
 
@@ -618,7 +518,6 @@ function loginStep1(credentials, interactive)
   local canReuse, storage = restoreConnection(accountKey)
 
   session.username = username
-  session.state = nil
   restorePersistedSessionCookies(storage, canReuse)
 
   MM.printStatus("MLP: Initialisiere Session...")
@@ -628,7 +527,7 @@ function loginStep1(credentials, interactive)
     collectSessionCookies()
   end
 
-  -- Persistierte Connection: Cookie-Jar (ggf. HttpOnly) ohne erneuten COOKIE:-Import
+  -- Persistierte Connection: Cookie-Jar (ggf. HttpOnly) wiederverwenden
   if canReuse then
     local persistedResult = tryPersistedAuth(storage)
     if persistedResult ~= false then
@@ -636,25 +535,20 @@ function loginStep1(credentials, interactive)
     end
   end
 
-  if password and password:match("^COOKIE:") then
-    parseCookieString(password:sub(8))
-    applySessionCookiesToConnection()
-    local cookieResult = tryCookieAuth()
-    if cookieResult == nil then
-      persistSessionCookies(storage)
-    end
-    return cookieResult
-  end
-
   if not username or username == "" or not password or password == "" then
-    return tryCookieAuth()
+    return "Bitte Benutzername und Passwort eingeben."
   end
 
+  -- Die gespeicherte Verbindung bleibt erhalten: Das Geräte-Cookie CAS_DEVICE_SESSION ("Trust this browser")
+  -- soll weiter gesendet werden. Die alte CAS_S_SESSION bleibt dabei im Cookie-Jar.
+  if canReuse then
+    -- Veraltete Session-Werte aus dem Speicher verwerfen, sonst bleibt eine alte VUSESSIONID aktiv.
+    session.sessionCookies = {}
+  end
   MM.printStatus("MLP: Authentifiziere mit Username/Passwort...")
-  local loginResult = performLogin(username, password)
+  local loginResult = performLogin(username, password, interactive)
 
   if loginResult.success then
-    session.state = nil
     local storage = rawget(_G, "LocalStorage")
     persistSessionCookies(storage)
     if loadContracts() then
@@ -664,90 +558,33 @@ function loginStep1(credentials, interactive)
     end
   end
 
-  if loginResult.requiresMfa then
-    session.state = "awaitingMfa"
-    session.mfaToken = loginResult.mfaToken
-    return {
-      title     = "SecureGo Plus Bestätigung",
-      challenge = "Bitte bestätigen Sie den Login in Ihrer SecureGo Plus App auf Ihrem Smartphone.\n\nÖffnen Sie die SecureGo Plus App und bestätigen Sie die Push-Benachrichtigung.",
-      label     = "TAN (falls Push nicht funktioniert)"
-    }
+  if loginResult.requiresBrowserTan then
+    return completeBrowserDetectionTan()
   end
 
   if isCredentialRejectionMessage(loginResult.error) then
     return LoginFailed
   end
-  if loginResult.needsCookie or (loginResult.error and (loginResult.error:find("403") or loginResult.error:find("JOSE"))) then
-    return tryCookieAuth()
-  end
   return loginResult.error or "Login fehlgeschlagen."
 end
 
-function tryCookieAuth()
-  local hasVuSession = session.sessionCookies.VUSESSIONID and session.sessionCookies.VUSESSIONID ~= ""
-
-  if not hasVuSession then
-    local cookieHeader = buildCookieHeader()
-    if cookieHeader == "" then
-      return "Cookie-Import erforderlich:\n\n" ..
-             "1. Melden Sie sich im Browser am MLP Kundenportal an\n" ..
-             "2. Öffnen Sie die Vertragsübersicht (damit vue.mlp.de geladen wird)\n" ..
-             "3. DevTools → Application → Cookies → https://vue.mlp.de\n" ..
-             "4. Kopieren Sie VUSESSIONID und BIGipServervue.mlp.de\n" ..
-             "5. Fügen Sie sie in MoneyMoney als 'Cookies' ein (Format: Name=Wert; Name2=Wert2)"
-    else
-      return "Cookie-Import: VUSESSIONID fehlt\n\n" ..
-             "Für die MLP Versicherungen-API wird VUSESSIONID von vue.mlp.de benötigt.\n\n" ..
-             "Bitte stellen Sie sicher, dass Sie:\n" ..
-             "1. Am MLP Kundenportal angemeldet sind\n" ..
-             "2. Die Vertragsübersicht geöffnet haben (für vue.mlp.de Cookies)\n" ..
-             "3. VUSESSIONID aus https://vue.mlp.de kopiert haben\n\n" ..
-             "Hinweis: Ein reines Dashboard-HAR (nur kundenportal.mlp.de ohne vue.mlp.de) " ..
-             "enthält keine VUSESSIONID. Login-HAR mit Vertragsübersicht verwenden."
-    end
-  end
-
-  MM.printStatus("MLP: Versuche Authentifizierung mit Cookies...")
-
-  local valid = isAuthenticated()
-  if valid == nil then
-    return "MLP ist gerade nicht erreichbar. Bitte in einigen Minuten erneut versuchen."
-  end
-  if valid then
-    local storage = rawget(_G, "LocalStorage")
-    persistSessionCookies(storage)
-    if loadContracts() then
-      return nil
-    else
-      return "Authentifiziert, aber keine Versicherungsverträge gefunden."
-    end
-  end
-
-  return "Cookie-Authentifizierung fehlgeschlagen.\n\n" ..
-         "Mögliche Ursachen:\n" ..
-         "- Cookies sind abgelaufen (Session nur kurze Zeit gültig)\n" ..
-         "- VUSESSIONID fehlt oder ist ungültig\n" ..
-         "- SSL-Zertifikat für vue.mlp.de nicht bestätigt\n\n" ..
-         "Bitte frische Cookies aus dem Browser exportieren."
-end
-
-function performLogin(username, password)
+function performLogin(username, password, interactive)
   if canUseJweLogin() then
     MM.printStatus("MLP: Versuche JWE-verschlüsselten Login...")
-    local jweResult = performJweLogin(username, password)
-    if jweResult.success or jweResult.requiresMfa then
+    local jweResult = performJweLogin(username, password, interactive)
+    if jweResult.success or jweResult.requiresBrowserTan then
       return jweResult
     end
     if jweResult.cryptoIncomplete then
       MM.printStatus("MLP: JWE-Krypto unvollständig — Klartext-Login...")
-      return performPlaintextLogin(username, password)
+      return performPlaintextLogin(username, password, interactive)
     end
     return jweResult
   end
 
   -- Username/Passwort bleibt auch ohne JWE-APIs: Klartext versuchen, sonst Cookie.
   MM.printStatus("MLP: JWE-Krypto-APIs nicht verfügbar — Klartext-Login...")
-  return performPlaintextLogin(username, password)
+  return performPlaintextLogin(username, password, interactive)
 end
 
 function isEmptyLoginSuccess(content)
@@ -757,15 +594,6 @@ end
 function parseLoginResponse(content)
   if isEmptyLoginSuccess(content) then
     return { success = true, emptyBody = true }
-  end
-
-  if content:find("challenge") or content:find("mfa") or content:find("tan") or
-     content:find("SecureGo") then
-    return {
-      success = false,
-      requiresMfa = true,
-      mfaToken = extractMfaToken(content)
-    }
   end
 
   local response = parseJson(content)
@@ -787,34 +615,38 @@ function parseLoginResponse(content)
     if response.error == "invalid_request" then
       return { success = false, error = "Token-Anfrage vom Server abgelehnt." }
     end
-    if response.error == "mfa_required" or response.error == "second_factor_required" then
-      return {
-        success = false,
-        requiresMfa = true,
-        mfaToken = response.challenge_token or response.challengeToken or extractMfaToken(content)
-      }
-    end
     return { success = false, error = response.error_description or response.error }
   end
 
-  if response.challengeType or response.mfaRequired or response.requiresSecondFactor then
-    return {
-      success = false,
-      requiresMfa = true,
-      mfaToken = response.challengeToken or extractMfaToken(content)
-    }
-  end
-
-  if response.success or response.authenticated then
+  if response.success or response.authenticated or authProcessCompleted(response) then
     return { success = true }
   end
 
   return { success = false, error = "Unbekannter Login-Status." }
 end
 
+-- Nach akzeptiertem Passwort-Login: Consent und Vue-Session herstellen, wie im Browser.
+function completeAcceptedLogin()
+  MM.printStatus("MLP: Login akzeptiert, schließe Post-Login-Flow ab...")
+  if completePostLoginFlow() then
+    return { success = true }
+  end
+  if isAuthenticated() then
+    return { success = true }
+  end
+  return { success = false, error = "Login erfolgreich, aber Vue-Session nicht herstellbar." }
+end
+
 function extractIframeUrlFromPortalResponse(content)
   if not content or content == "" then
     return nil
+  end
+
+  -- api/app/vu liefert XML (<IframePageDto><iframeUrl>…</iframeUrl>), der Query-String ist XML-escaped.
+  local xmlIframeUrl = content:match("<iframeUrl>([^<]+)</iframeUrl>")
+  if xmlIframeUrl then
+    local unescaped = xmlIframeUrl:gsub("&amp;", "&")
+    return (assertAllowedMlpUrl(unescaped))
   end
 
   local iframeUrl = content:match('"iframeUrl"%s*:%s*"([^"]+)"')
@@ -840,10 +672,10 @@ function extractIframeUrlFromPortalResponse(content)
   return nil
 end
 
-function establishKundenportalSession()
+-- Übergibt den Autorisierungscode aus der Consent-Antwort an kp.mlp.de (wie der Browser).
+function establishKundenportalSession(authParameters)
   MM.printStatus("MLP: Stelle Kundenportal-Session her...")
-  local okpUrl = CONSTANTS.baseUrl .. CONSTANTS.portalOkpLogin
-  local content = connection:get(okpUrl)
+  local content = connection:get(CONSTANTS.authRedirectUri .. "?" .. authParameters)
   if content then
     collectSessionCookies()
   end
@@ -867,6 +699,20 @@ function fetchVueIframeUrl()
   return extractIframeUrlFromPortalResponse(content)
 end
 
+-- Liest einen Query-Parameter aus einer URL. Der Wert wird unverändert übernommen (wie im Browser).
+function queryParamFromUrl(url, name)
+  local query = url:match("%?([^#]*)")
+  if not query then
+    return nil
+  end
+  for key, value in query:gmatch("([^&=]+)=([^&]*)") do
+    if key == name then
+      return (value:gsub("%%(%x%x)", function(hex) return string.char(tonumber(hex, 16)) end))
+    end
+  end
+  return nil
+end
+
 function establishVueSession(iframeUrl)
   if not iframeUrl or iframeUrl == "" then
     return false
@@ -876,6 +722,12 @@ function establishVueSession(iframeUrl)
     MM.printStatus("MLP: Vue-iframe URL abgelehnt: " .. tostring(allowErr))
     return false
   end
+  local token = queryParamFromUrl(allowed, "token")
+  local source = queryParamFromUrl(allowed, "source")
+  if not token or token == "" or not source or source == "" then
+    MM.printStatus("MLP: Vue-iframe URL ohne token oder source.")
+    return false
+  end
 
   MM.printStatus("MLP: Initialisiere Vue-Session...")
   local clientContent = connection:get(allowed)
@@ -883,13 +735,16 @@ function establishVueSession(iframeUrl)
     collectSessionCookies()
   end
 
+  -- Der Browser sendet Source und X-Authorization aus der Iframe-URL (HAR: token/set am vk-Client).
   local headers = {
     ["Content-Type"] = "application/json",
     ["Accept"] = "application/json, text/plain, */*",
     ["Accept-Language"] = "de-DE,de;q=0.9",
     ["Referer"] = CONSTANTS.vueApiBase .. "/vu/client/",
     ["Origin"] = CONSTANTS.vueApiBase,
-    ["User-Agent"] = CONSTANTS.userAgent
+    ["User-Agent"] = CONSTANTS.userAgent,
+    ["Source"] = source,
+    ["X-Authorization"] = token
   }
 
   local cookieHeader = buildCookieHeader(true)
@@ -906,21 +761,35 @@ function establishVueSession(iframeUrl)
       headers
     )
   end)
-
-  if success and tokenResponse then
-    collectSessionCookies()
-    return true
+  if not success or not tokenResponse then
+    MM.printStatus("MLP: Vue-Token-Aufruf ohne Antwort.")
+    return false
   end
 
-  return clientContent ~= nil
+  -- Der Server meldet Fehler als JSON mit "status" (z. B. 403). Das ist kein Erfolg.
+  local tokenError = parseJson(tokenResponse)
+  if type(tokenError) == "table" and type(tokenError.status) == "number" and tokenError.status >= 400 then
+    MM.printStatus("MLP: Vue-Token-Aufruf abgelehnt (Status " .. tokenError.status .. ").")
+    return false
+  end
+
+  collectSessionCookies()
+  return true
 end
 
 function completePostLoginFlow()
-  if not tryConsentCall() then
-    MM.printStatus("MLP: Consent-Aufruf fehlgeschlagen oder nicht erforderlich.")
+  local consentContent, consentError = callConsent()
+  if not consentContent then
+    MM.printStatus("MLP: " .. consentError)
+    return false
+  end
+  local authParameters, parameterError = consentAuthorizationParameters(consentContent)
+  if not authParameters then
+    MM.printStatus("MLP: " .. parameterError)
+    return false
   end
 
-  if not establishKundenportalSession() then
+  if not establishKundenportalSession(authParameters) then
     MM.printStatus("MLP: Kundenportal-Session konnte nicht hergestellt werden.")
     return false
   end
@@ -939,25 +808,22 @@ function completePostLoginFlow()
   return isAuthenticated()
 end
 
-function performJweLogin(username, password)
-  -- 1. Hole Public Key für RSA-Verschlüsselung
+function performJweLogin(username, password, interactive)
+  -- 1. Hole den PIN-Verschlüsselungsschlüssel (OAuth-authorize + init-ui)
   mlpDebugLog("MLP-DEBUG: performJweLogin startet")
-  local publicKey = fetchPublicKey()
+  local publicKey, pinNonce, keyError = fetchPinEncryptionKey()
   if not publicKey then
-    MM.printStatus("MLP: Kein Public Key verfügbar, fallback zu Cookie-Import...")
-    return { success = false, error = "JOSE", needsCookie = true }
+    return { success = false, error = keyError }
   end
   mlpDebugLog("MLP-DEBUG: Public Key erfolgreich geholt, Typ=" .. type(publicKey))
 
   -- 2. Bereite Login-Payload vor
+  -- Klartext wie der Browser (Login-Bundle, pinEncryptionService.encrypt):
+  -- netkey = VR-NetKey/Login-Name, pin = Passwort, nonce = pinEncryptionNonce aus init-ui.
   local loginPayload = {
-    username = username,
-    password = password,
-    grant_type = "password",
-    deviceInfo = {
-      deviceType = "BROWSER",
-      userAgent = CONSTANTS.userAgent
-    }
+    netkey = username,
+    pin = password,
+    nonce = pinNonce
   }
 
   -- 3. Generiere JWE
@@ -1001,31 +867,25 @@ function performJweLogin(username, password)
 
   collectSessionCookies()
 
-  local loginResult = parseLoginResponse(content)
-  if loginResult.requiresMfa then
-    return loginResult
+  local tanResult = browserDetectionLoginResult(content, interactive)
+  if tanResult then
+    return tanResult
   end
+
+  local loginResult = parseLoginResponse(content)
   if not loginResult.success then
     return loginResult
   end
 
-  MM.printStatus("MLP: Login akzeptiert, schließe Post-Login-Flow ab...")
-  if completePostLoginFlow() then
-    return { success = true }
-  end
-
-  if isAuthenticated() then
-    return { success = true }
-  end
-
-  return {
-    success = false,
-    error = "Login erfolgreich, aber Vue-Session nicht herstellbar.",
-    needsCookie = true
-  }
+  return completeAcceptedLogin()
 end
 
-function performPlaintextLogin(username, password)
+function performPlaintextLogin(username, password, interactive)
+  local started, startError = startPortalAuthorization()
+  if not started then
+    return { success = false, error = startError }
+  end
+
   local loginPayload = {
     username = username,
     password = password,
@@ -1059,55 +919,34 @@ function performPlaintextLogin(username, password)
 
   collectSessionCookies()
 
+  local tanResult = browserDetectionLoginResult(content, interactive)
+  if tanResult then
+    return tanResult
+  end
   if content:find('"error":') and content:find("403") then
-    return { success = false, error = "JOSE", needsCookie = true }
+    return { success = false, error = "Der Login-Server hat die Anfrage abgelehnt (403). Bitte später erneut versuchen." }
   end
 
   local response = parseJson(content)
   if not response then
-    if content:find("challenge") or content:find("mfa") or content:find("tan") then
-      return { success = false, requiresMfa = true, mfaToken = extractMfaToken(content) }
-    end
     if isAuthenticated() then
       return { success = true }
     end
     return { success = false, error = "Ungültige Server-Antwort." }
   end
 
-  if response.challengeType or response.mfaRequired or response.requiresSecondFactor then
-    return { success = false, requiresMfa = true, mfaToken = response.challengeToken }
-  end
-
   if response.error or response.errorMessage then
     return { success = false, error = response.errorMessage or response.error }
   end
 
-  if response.success or response.authenticated or isAuthenticated() then
+  if response.success or response.authenticated or authProcessCompleted(response) then
+    return completeAcceptedLogin()
+  end
+  if isAuthenticated() then
     return { success = true }
   end
 
   return { success = false, error = "Login-Status unbekannt." }
-end
-
-function extractMfaToken(content)
-  -- Extrahiert MFA Token aus verschiedenen Response-Formaten
-  if not content then
-    return nil
-  end
-  local token = content:match('"challengeToken"%s*:%s*"([^"]+)"') or
-                content:match('"challenge_token"%s*:%s*"([^"]+)"') or
-                content:match('"mfaToken"%s*:%s*"([^"]+)"') or
-                content:match('"mfa_token"%s*:%s*"([^"]+)"') or
-                content:match('"challengeId"%s*:%s*"([^"]+)"') or
-                content:match('"challenge_id"%s*:%s*"([^"]+)"') or
-                content:match('"secureGoPlusToken"%s*:%s*"([^"]+)"') or
-                content:match('"secureGoPlus_challenge_token"%s*:%s*"([^"]+)"') or
-                content:match('"transactionId"%s*:%s*"([^"]+)"') or
-                content:match('"tanSession"%s*:%s*"([^"]+)"') or
-                content:match('"tan_session"%s*:%s*"([^"]+)"') or
-                content:match('"token"%s*:%s*"([^"]+)"')
-
-  return token
 end
 
 function urlEncode(str)
@@ -1119,83 +958,205 @@ function urlEncode(str)
   end)
 end
 
-function submitMfaCode(tanCode)
-  if not session.mfaToken then
-    return CONSTANTS.mfaSessionExpired
+-- Der Server verlangt nach dem Passwort-Login die Browser-Erkennung mit SecureGo-Plus-Freigabe.
+-- Die Schrittfolge entspricht dem Browser-Ablauf aus der HAR.
+function requiresBrowserDetectionTan(content)
+  local response = parseJson(content)
+  local auth = type(response) == "table" and response.authenticationProcessResponse or nil
+  local nextStep = type(auth) == "table" and auth.nextAuthenticationProcessStep or nil
+  if type(nextStep) ~= "table" or type(nextStep.actions) ~= "table" then
+    return false
   end
+  for _, action in ipairs(nextStep.actions) do
+    if action.stepType == "START_TAN_PROCESS_FOR_BROWSER_DETECTION_AUTH" then
+      return true
+    end
+  end
+  return false
+end
 
-  MM.printStatus("MLP: Übermittle MFA...")
+-- Liefert das Login-Ergebnis, wenn die Browser-Erkennung nötig ist; sonst nil.
+-- Ohne Benutzerinteraktion (Hintergrund-Refresh) startet keine SecureGo-Freigabe; der Login bricht ab.
+function browserDetectionLoginResult(content, interactive)
+  if not requiresBrowserDetectionTan(content) then
+    return nil
+  end
+  if not interactive then
+    return { success = false, error = "MLP: SecureGo-Freigabe nötig. Bitte den Login in MoneyMoney manuell starten." }
+  end
+  local tanError = startBrowserDetectionTan()
+  if tanError then
+    return { success = false, error = tanError }
+  end
+  return { success = false, requiresBrowserTan = true }
+end
 
-  local mfaPayload = {
-    challengeToken = session.mfaToken,
-    tan = tanCode and trim(tanCode) or nil,
-    confirmPush = not tanCode or trim(tanCode) == ""
-  }
-
-  local jsonBody = encodeJson(mfaPayload)
+-- Ruft einen Schritt des Auth-Prozesses auf. Liefert die geparste Antwort oder nil plus Fehlermeldung.
+function callAuthProcess(method, path, body)
   local headers = {
-    ["Content-Type"] = "application/json",
-    ["Accept"] = "application/json"
+    ["Accept"] = "application/json",
+    ["Origin"] = "https://financepilot-pe.mlp.de",
+    ["Referer"] = "https://financepilot-pe.mlp.de/"
   }
-
+  local hasBody = body ~= nil and body ~= ""
+  if hasBody then
+    headers["Content-Type"] = "application/json"
+  end
   local cookieHeader = buildCookieHeader(false)
   if cookieHeader ~= "" then
     headers["Cookie"] = cookieHeader
   end
 
   local content = connection:request(
-    "POST",
-    CONSTANTS.authBaseUrl .. "/services_auth/auth-backend/api/authentication/mfa",
-    jsonBody,
-    "application/json",
+    method,
+    CONSTANTS.authBaseUrl .. path,
+    body,
+    hasBody and "application/json" or nil,
     headers
   )
-
   if not content then
-    return "Keine Antwort bei MFA."
+    return nil, "Keine Antwort vom Server (" .. path .. ")."
   end
-
   collectSessionCookies()
 
   local response = parseJson(content)
   if not response then
-    if isAuthenticated() then
-      session.state = nil
-      if loadContracts() then return nil end
+    return nil, "Ungültige Antwort vom Server (" .. path .. ")."
+  end
+  return response
+end
+
+function authProcessCompleted(response)
+  local auth = response.authenticationProcessResponse
+  return type(auth) == "table" and auth.authenticationProcessCompleted == true
+end
+
+function hasSecureGoPlusMethod(delivery)
+  if type(delivery.tanVerfahren) ~= "table" then
+    return false
+  end
+  for _, method in ipairs(delivery.tanVerfahren) do
+    if method.typ == "SECUREGO_PLUS" then
+      return true
     end
-    return "Ungültige MFA-Antwort."
+  end
+  return false
+end
+
+-- Schritt 1: TAN-Verfahren prüfen und die SecureGo-Freigabe anstoßen.
+-- Liefert nil bei Erfolg, sonst eine Fehlermeldung.
+function startBrowserDetectionTan()
+  MM.printStatus("MLP: Starte Browser-Erkennung mit SecureGo Plus...")
+
+  local methods, err = callAuthProcess("POST", CONSTANTS.tanMethodsCheckPath, "{}")
+  if not methods then
+    return err
+  end
+  if methods.hasTanMethods ~= true then
+    return "MLP: Für diesen Zugang ist kein TAN-Verfahren hinterlegt."
   end
 
-  if response.error then
-    session.state = "awaitingMfa"
-    return {
-      title = "SecureGo Plus",
-      challenge = "Fehler: " .. (response.errorMessage or response.error) .. "\n\nBitte erneut versuchen:",
-      label = "TAN"
-    }
+  local started
+  started, err = callAuthProcess("POST", CONSTANTS.browserDetectionStartPath, '{"locale":"de-DE"}')
+  if not started then
+    return err
+  end
+  local current = started.authenticationProcessResponse
+    and started.authenticationProcessResponse.resultOfCurrentAuthenticationProcessStep
+  local tanProcessId = type(current) == "table" and current.tanProzessId or nil
+  if type(tanProcessId) ~= "string" or tanProcessId == "" then
+    return "MLP: TAN-Prozess-ID fehlt in der Antwort."
   end
 
-  if response.success or response.authenticated then
-    session.state = nil
-    if completePostLoginFlow() and loadContracts() then
+  local delivery
+  delivery, err = callAuthProcess("POST", CONSTANTS.tanDeliveryPath, encodeJson({ tanProzessId = tanProcessId }))
+  if not delivery then
+    return err
+  end
+  if not hasSecureGoPlusMethod(delivery) then
+    return "MLP: SecureGo Plus ist für diesen Zugang nicht verfügbar."
+  end
+
+  local approval
+  approval, err = callAuthProcess(
+    "POST",
+    CONSTANTS.directApprovalPath,
+    encodeJson({ tanProzessId = tanProcessId, sprachschluessel = "de-DE" })
+  )
+  if not approval then
+    return err
+  end
+  if approval.status ~= "DIREKTFREIGABE_OFFEN" or type(approval.transaktionsIdDirektfreigabe) ~= "string" then
+    return "MLP: SecureGo-Freigabe konnte nicht gestartet werden (Status: " .. tostring(approval.status) .. ")."
+  end
+
+  -- Der Browser fragt den Freigabestatus mit der tanProzessId ab (HAR), nicht mit transaktionsIdDirektfreigabe.
+  session.browserTanProcessId = tanProcessId
+  return nil
+end
+
+-- Wartet ohne Eingabe in MoneyMoney auf die Freigabe in der SecureGo-Plus-App.
+-- Liefert nil, sobald die Freigabe bestätigt ist, sonst eine Fehlermeldung.
+-- Die Abfrage nutzt die tanProzessId, wie der Browser (siehe HAR).
+function waitForSecureGoApproval(tanProcessId, maxAttempts)
+  MM.printStatus("MLP: Warte auf die Freigabe in der SecureGo-Plus-App...")
+  for attempt = 1, maxAttempts do
+    local status, err = callAuthProcess("GET", CONSTANTS.directApprovalPath .. "/" .. tanProcessId, nil)
+    if not status then
+      return err
+    end
+    if status.status == "DIREKTFREIGABE_BESTAETIGT" then
       return nil
     end
-    if loadContracts() then
-      return nil
+    if status.status ~= "DIREKTFREIGABE_OFFEN" then
+      return "SecureGo-Freigabe nicht bestätigt (Status: " .. tostring(status.status) .. ")."
     end
-    return "MFA erfolgreich, aber keine Vertragsdaten."
+    if attempt < maxAttempts then
+      MM.sleep(CONSTANTS.secureGoPollSeconds)
+    end
+  end
+  return "SecureGo-Freigabe wurde in der Wartezeit nicht bestätigt. Bitte den Login erneut starten."
+end
+
+-- Wartet auf die SecureGo-Freigabe, schließt die Browser-Erkennung ab und markiert den Browser als
+-- vertrauenswürdig (useBrowserDetection = true, wie "Trust this browser" im Browser).
+function completeBrowserDetectionTan()
+  local tanProcessId = session.browserTanProcessId
+  session.browserTanProcessId = nil
+  if not tanProcessId then
+    return CONSTANTS.mfaSessionExpired
   end
 
-  if response.pending or response.waiting then
-    session.state = "awaitingMfa"
-    return {
-      title = "SecureGo Plus",
-      challenge = "Warte auf Bestätigung...\n\nBitte in der App bestätigen oder TAN eingeben:",
-      label = "TAN"
-    }
+  local approvalError = waitForSecureGoApproval(tanProcessId, CONSTANTS.secureGoPollAttempts)
+  if approvalError then
+    return approvalError
   end
 
-  return "Unbekannter MFA-Status."
+  local termination, err = callAuthProcess("POST", CONSTANTS.browserDetectionTerminationPath, "")
+  if not termination then
+    return err
+  end
+  if not authProcessCompleted(termination) then
+    return "MLP: Browser-Erkennung konnte nicht abgeschlossen werden."
+  end
+
+  local choice
+  choice, err = callAuthProcess("POST", CONSTANTS.browserDetectionChoosePath, '{"useBrowserDetection":true}')
+  if not choice then
+    return err
+  end
+  if not authProcessCompleted(choice) then
+    return "MLP: Browser konnte nicht als vertrauenswürdig gespeichert werden."
+  end
+
+  if not completePostLoginFlow() then
+    return "Login erfolgreich, aber Kundenportal-Session konnte nicht hergestellt werden."
+  end
+  persistSessionCookies(rawget(_G, "LocalStorage"))
+  if loadContracts() then
+    return nil
+  end
+  return "Login erfolgreich, aber keine Versicherungsverträge gefunden."
 end
 
 function collectSessionCookies()
@@ -1232,36 +1193,6 @@ function collectSessionCookiesFromText(cookieText)
 
   local bigipServer = cookieText:match("BIGipServervue%.mlp%.de=([^;,%s]+)")
   if bigipServer then session.sessionCookies.BIGipServervue_mlp_de = bigipServer end
-end
-
-function parseCookieString(cookieString)
-  if not cookieString or cookieString == "" then return end
-
-  local seen = {}
-  local pos = 1
-  local len = #cookieString
-
-  while pos <= len do
-    local nextSemi = cookieString:find(";", pos) or len + 1
-    local part = cookieString:sub(pos, nextSemi - 1)
-
-    local eqPos = part:find("=", 1, true)
-    if eqPos then
-      local name = trim(part:sub(1, eqPos - 1))
-      local value = trim(part:sub(eqPos + 1))
-
-      if name ~= "" then
-        local storageName = name
-        if storageName == "VUSESSIONID" and seen["VUSESSIONID"] then
-          storageName = "VUSESSIONID2"
-        end
-        seen[storageName] = true
-        session.sessionCookies[storageName] = value
-      end
-    end
-
-    pos = nextSemi + 1
-  end
 end
 
 function cookieWireName(storageName)
@@ -1311,7 +1242,8 @@ function buildCookieHeader(forVueApi)
   return table.concat(parts, "; ")
 end
 
-function tryConsentCall()
+-- Ruft den Consent-Schritt auf. Liefert die Antwort oder nil plus Fehlermeldung.
+function callConsent()
   local authCookieHeader = buildCookieHeader(false)
   local headers = {
     ["Content-Type"] = "application/json",
@@ -1340,11 +1272,30 @@ function tryConsentCall()
     )
   end)
 
-  if success and contentOrError then
-    collectSessionCookies()
-    return true
+  if not success then
+    return nil, "Consent-Aufruf fehlgeschlagen: " .. tostring(contentOrError)
   end
-  return false
+  if not contentOrError then
+    return nil, "Consent-Aufruf ohne Antwort."
+  end
+  collectSessionCookies()
+  return contentOrError
+end
+
+function tryConsentCall()
+  return callConsent() ~= nil
+end
+
+-- Liest die OAuth-Parameter (code, state, iss) aus der Consent-Antwort als Query-String.
+function consentAuthorizationParameters(content)
+  local response = parseJson(content)
+  local post = type(response) == "table" and response.postAuthenticationProcessResponse or nil
+  local step = type(post) == "table" and post.resultOfCurrentPostAuthenticationProcessStep or nil
+  local parameter = type(step) == "table" and step.parameter or nil
+  if type(parameter) ~= "string" or not parameter:find("code=", 1, true) then
+    return nil, "Consent-Antwort enthält keinen Autorisierungscode."
+  end
+  return parameter
 end
 
 function tryContractListAuth(cookieHeader)
@@ -1377,6 +1328,7 @@ function tryContractListAuth(cookieHeader)
 
     local data = parseJson(contentOrError)
     if (data and data.contractList) or (contentOrError and contentOrError:find('"contractList"')) then
+      session.contractListContent = contentOrError
       return true
     end
   elseif tryConsentCall() then
@@ -1386,6 +1338,7 @@ function tryContractListAuth(cookieHeader)
     if success and contentOrError then
       local data = parseJson(contentOrError)
       if (data and data.contractList) or (contentOrError and contentOrError:find('"contractList"')) then
+        session.contractListContent = contentOrError
         return true
       end
     end
@@ -1412,8 +1365,30 @@ function isAuthenticated()
   return tryContractListAuth(nil)
 end
 
+-- Übernimmt die Vertragsliste aus einer vue.mlp.de-Antwort. true, wenn mindestens ein Vertrag gefunden wurde.
+function applyVueContractList(content)
+  local apiData = parseJson(content)
+  if not (apiData and apiData.contractList) then
+    return false
+  end
+  local contracts = parseVueContracts(apiData.contractList)
+  if #contracts == 0 then
+    return false
+  end
+  session.contracts = contracts
+  MM.printStatus("MLP: " .. #session.contracts .. " Vertrag(e) geladen.")
+  return true
+end
+
 function loadContracts()
   MM.printStatus("MLP: Lade Vertragsdaten...")
+
+  -- Hat die Session-Prüfung die Liste schon geholt, wird sie wiederverwendet (keine zweite Anfrage).
+  local cachedContent = session.contractListContent
+  session.contractListContent = nil
+  if cachedContent and applyVueContractList(cachedContent) then
+    return true
+  end
 
   local vueCookieHeader = buildCookieHeader(true)
   local headers = {
@@ -1450,16 +1425,8 @@ function loadContracts()
     end
   end
 
-  if success and content then
-    local apiData = parseJson(content)
-    if apiData and apiData.contractList then
-      local contracts = parseVueContracts(apiData.contractList)
-      if #contracts > 0 then
-        session.contracts = contracts
-        MM.printStatus("MLP: " .. #session.contracts .. " Vertrag(e) geladen.")
-        return true
-      end
-    end
+  if success and content and applyVueContractList(content) then
+    return true
   end
 
   local authCookieHeader = buildCookieHeader(false)
@@ -1748,7 +1715,7 @@ function calculateTotalContributions(contract)
 end
 
 function EndSession()
-  session = { contracts = {}, state = nil, username = nil, password = nil, mfaToken = nil, sessionCookies = {} }
+  session = { contracts = {}, username = nil, password = nil, browserTanProcessId = nil, sessionCookies = {} }
   MM.printStatus("MLP: Session beendet.")
 end
 
